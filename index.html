@@ -12,16 +12,20 @@
       min-height: 100vh; margin: 0; display: grid; place-items: center;
       color: #20202b; background: #fafafa;
     }
-    main { width: min(640px, calc(100vw - 40px)); text-align: center; }
+    main { width: min(1100px, calc(100vw - 40px)); text-align: center; }
     p {
       margin: 0 0 34px; color: #18181b;
       font-size: clamp(18px, 2vw, 22px); font-weight: 500; line-height: 1.65;
     }
+    .copy-line { display: block; white-space: nowrap; }
     .requirement {
       display: block; margin-top: 10px;
       font-size: 15px; font-weight: 400;
     }
-    nav { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    nav {
+      width: min(640px, 100%); margin: 0 auto;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    }
     a {
       display: grid; place-items: center; min-height: 72px; padding: 18px;
       color: inherit; text-decoration: none; background: #fff;
@@ -29,12 +33,13 @@
       transition: transform .18s ease, background .18s ease;
     }
     a:hover { transform: translateY(-2px); background: #f4f4f6; }
+    @media (max-width: 720px) { .copy-line { white-space: normal; } }
     @media (max-width: 480px) { nav { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <main>
-    <p>한 작품을 위한 청각적 메커니즘 구현과 시각 요소 디자인을 각각 진행 중입니다.<br>곧 두 요소를 결합해 하나의 작품으로 완성할 계획입니다.<span class="requirement">크롬 브라우저에서 정상 작동하며, 이어폰과 카메라 허용이 필수입니다.</span></p>
+    <p><span class="copy-line">한 작품을 위한 청각적 메커니즘 구현과 시각 요소 디자인을 각각 진행 중입니다.</span><span class="copy-line">곧 두 요소를 결합해 하나의 작품으로 완성할 계획입니다.</span><span class="requirement">(크롬 브라우저에서 정상 작동하며, 이어폰과 카메라 허용이 필수입니다.)</span></p>
     <nav>
       <a href="./hand-sweep/">소리 프로토타입</a>
       <a href="./presence-glass/">시각 프로토타입</a>
