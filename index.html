@@ -13,7 +13,10 @@
       color: #20202b; background: #fafafa;
     }
     main { width: min(640px, calc(100vw - 40px)); text-align: center; }
-    p { margin: 0 0 34px; color: #777782; font-size: 14px; line-height: 1.7; }
+    p {
+      margin: 0 0 34px; color: #18181b;
+      font-size: clamp(18px, 2vw, 22px); font-weight: 500; line-height: 1.65;
+    }
     nav { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     a {
       display: grid; place-items: center; min-height: 72px; padding: 18px;
