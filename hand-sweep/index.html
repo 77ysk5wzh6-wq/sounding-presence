@@ -1,0 +1,3012 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sounding Presence — Audio Scenes</title>
+<link rel="icon" href="data:,">
+<!--
+  hand_sweep presentation — 교수님 전달·배포용 인터페이스.
+  내부 튜닝 파라미터는 보존하되 화면에는 시작·장면 전환 버튼만 노출한다.
+  원본: hand_sweep.html
+  ----------------------------------------------------------------
+  · 흰 배경 + 손 추적만 (카메라 화면 없음)
+  · 손바닥 중심(손목~중지밑동)의 이동 속도 → 마찰음 (손가락 개별 아님 = 쓸어내림)
+  · 왼손/오른손 독립 오디오 + 스테레오 패닝 (왼손=왼쪽, 오른손=오른쪽)
+  · 1€ 필터 + 데드존 스무딩 → 조금 움직이면 무음, 확실한 움직임에서 연속 변화
+  · 연필 톤: 실제 종이 마찰 granular + 고정된 책상 modal 공명
+  · 실행: 로컬 서버 필요 (카메라 권한).
+-->
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #fafafa; font-family: -apple-system, system-ui, sans-serif; }
+  #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); opacity: 0; pointer-events: none; }
+  #overlay { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 2; }
+  #ui {
+    position: fixed; z-index: 5; top: 14px; left: 14px;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 10px 12px; border-radius: 12px;
+    background: rgba(255,255,255,.85); color: #18181b; font-size: 13px;
+    box-shadow: 0 2px 14px rgba(0,0,0,.08); backdrop-filter: blur(6px);
+  }
+  #ui button { font: inherit; cursor: pointer; padding: 7px 13px; border-radius: 8px;
+    border: 1px solid rgba(0,0,0,.15); background: #fff; }
+  #ui button:hover { background: #f0f0f0; }
+  #ui label { display: flex; align-items: center; gap: 5px; }
+  #ui .val { opacity: .65; font-variant-numeric: tabular-nums; min-width: 30px; }
+  #ui input[type=range] { width: 100px; }
+  /* 파라미터 그룹: 음색별로 접히는 박스 */
+  #ui .grp { flex: 0 0 100%; display: flex; gap: 10px 14px; align-items: center; flex-wrap: wrap;
+    padding: 7px 10px; border-radius: 9px; border: 1px solid rgba(0,0,0,.08);
+    background: rgba(0,0,0,.025); }
+  #ui .grp[hidden] { display: none; }
+  #ui .ghead { flex: 0 0 100%; font-size: 11px; letter-spacing: .04em; opacity: .5; margin-bottom: -2px; }
+  #ui .grp label { font-size: 12px; }
+  #status { position: fixed; z-index: 5; bottom: 12px; left: 14px; color: #71717a; font-size: 12px;
+    font-variant-numeric: tabular-nums; }
+  /* 눈 감으면 서서히 덮이는 블랙 오버레이 (opacity는 JS가 매 프레임 제어) */
+  #blackout { position: fixed; inset: 0; z-index: 20; background: #000; opacity: 0; pointer-events: none; }
+
+  /* 발표용 UI: 실행에 필요한 숨은 파라미터 DOM은 유지하고 조작 패널만 제거한다. */
+  #ui {
+    left: 50%; right: auto; transform: translateX(-50%);
+    width: max-content; max-width: calc(100vw - 28px);
+    justify-content: center; flex-wrap: wrap;
+    padding: 9px; gap: 7px;
+  }
+  #ui > span,
+  #ui .grp,
+  #ui #reset { display: none !important; }
+  #ui #start,
+  #ui .timbreChoice {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 40px; white-space: nowrap;
+  }
+  #status { display: none !important; }
+  @media (max-width: 620px) {
+    #ui { top: 8px; max-width: calc(100vw - 16px); }
+    #ui button { padding: 7px 10px; font-size: 12px; }
+    #ui #start { flex-basis: 100%; }
+  }
+</style>
+
+<video id="cam" autoplay playsinline muted></video>
+<canvas id="overlay"></canvas>
+<div id="blackout"></div>
+
+<div id="ui">
+  <button id="start">🔊 시작 (카메라 + 소리)</button>
+  <span style="font-size:12px;opacity:.7">음색</span>
+  <button class="timbreChoice" data-timbre="water-drops">🌊 물</button>
+  <button class="timbreChoice" data-timbre="bark-friction">✏️ 연필</button>
+  <button class="timbreChoice" data-timbre="harp-strings">🪉 하프</button>
+  <button class="timbreChoice" data-timbre="wind-flow">🌬️ 바람</button>
+  <button id="reset" title="이 음색의 슬라이더를 기본값으로">↺ 기본값</button>
+  <span style="font-size:12px;opacity:.7">🎧 이어폰 권장</span>
+
+  <!-- ── 공통 ── -->
+  <div class="grp">
+    <div class="ghead">공통</div>
+    <label>음높이 <input id="pitch" type="range" min="0" max="1" step="0.01" value="0.45"><span class="val" id="pitchVal">0.45</span></label>
+    <label>볼륨 <input id="vol" type="range" min="0" max="1" step="0.01" value="1.0"><span class="val" id="volVal">1.00</span></label>
+    <label>민감도 <input id="sens" type="range" min="0.2" max="2" step="0.05" value="1"><span class="val" id="sensVal">1.00</span></label>
+    <label title="MediaPipe가 제공하는 손별 score. 이 값보다 낮으면 해당 프레임의 위치·속도·소리를 무시">손 신뢰도 <input id="handConf" type="range" min="0.6" max="0.95" step="0.01" value="0.70"><span class="val" id="handConfVal">0.70</span></label>
+    <label>손가락반영 <input id="finger" type="range" min="0" max="1" step="0.05" value="0.45"><span class="val" id="fingerVal">0.45</span></label>
+  </div>
+
+  <!-- ── 공간(head shadow) ── -->
+  <div class="grp">
+    <div class="ghead">🎧 공간 — 머리 차폐 모델 (구형 머리 r=9.19cm)</div>
+    <label title="0=기존 HRTF만(A/B 비교용), 1=head shadow 위주">모델 반영 <input id="hsMix" type="range" min="0" max="1" step="0.01" value="0.6"><span class="val" id="hsMixVal">0.60</span></label>
+    <label title="귀별 1/r 거리감쇠에 의한 좌우 레벨차. 가까울수록 자동으로 커짐">좌우 레벨차 <input id="hsIld" type="range" min="0" max="1" step="0.01" value="0.8"><span class="val" id="hsIldVal">0.80</span></label>
+    <label title="머리 반대편 귀의 고역 차폐량(머리가 저역통과 필터로 작용)">머리 차폐 <input id="hsShadow" type="range" min="0" max="1" step="0.01" value="0.7"><span class="val" id="hsShadowVal">0.70</span></label>
+    <label title="★거리감의 핵심. 멀수록 잔향 비중↑(DRR). 볼륨을 안 줄여도 거리가 느껴짐">거리 잔향(DRR) <input id="revAmt" type="range" min="0" max="1.5" step="0.01" value="0.42"><span class="val" id="revAmtVal">0.42</span></label>
+    <label title="거리에 따른 볼륨 차이. 0=일정(잔향으로만 거리 표현), 1=물리적 1/r(약 15dB)">거리 볼륨차 <input id="distAmt" type="range" min="0" max="1" step="0.01" value="0.73"><span class="val" id="distAmtVal">0.73</span></label>
+    <label title="Woodworth 모델 귀별 도달 시간차. 1=물리값(최대 689μs). 저역 방향감의 핵심">ITD 시간차 <input id="itdAmt" type="range" min="0" max="1.5" step="0.01" value="0.86"><span class="val" id="itdAmtVal">0.86</span></label>
+    <label title="근접 시 저역을 좌우로 분리(미세 시간차). 저음이 머릿속 중앙에 뭉치는 것 방지">근접 저역 분리 <input id="lowWide" type="range" min="0" max="1" step="0.01" value="0.6"><span class="val" id="lowWideVal">0.60</span></label>
+    <label title="다가옴/멀어짐 → 음높이 미세 변화. 1=물리값(1m/s에서 5cents, 거의 안 들림). 2~4로 올려야 체감됨">도플러 <input id="doppler" type="range" min="0" max="6" step="0.05" value="2.5"><span class="val" id="dopplerVal">2.50</span></label>
+    <label title="손바닥이 얼굴을 향할수록 직접음·고역이 열리고, 옆으로 돌면 반사 비중이 커짐">손바닥 지향성 <input id="palmDir" type="range" min="0" max="1" step="0.01" value="0.7"><span class="val" id="palmDirVal">0.70</span></label>
+    <label title="0=브라우저 HRTF+구형 머리, 1=CIPIC 측정 HRIR. 27방향 필터를 90ms 크로스페이드">측정 HRTF <input id="hrtfMix" type="range" min="0" max="1" step="0.01" value="0.06"><span class="val" id="hrtfMixVal">0.06</span></label>
+  </div>
+
+  <!-- ── 확장 공간 엔진 ── -->
+  <div class="grp">
+    <div class="ghead">🏛 확장 엔진 — 룸/거리모델/반사/차폐 (§1·§3~§7·§9·§12·§14)</div>
+    <label title="확장 엔진 전체 on/off. 끄면 기존(A+B+C) 동작만 남아 A/B 비교 가능"><input id="engineOn" type="checkbox" checked style="width:auto"> 엔진 ON</label>
+    <label title="거리 감쇠 곡선 종류(§12)">거리모델
+      <select id="distModel" style="font:inherit;padding:2px 4px;border-radius:6px">
+        <option value="inverse" selected>inverse</option>
+        <option value="linear">linear</option>
+        <option value="exponential">exponential</option>
+      </select></label>
+    <label title="거리 감쇠 강도. 클수록 멀어질 때 급격히 작아짐">rolloff <input id="rolloff" type="range" min="0" max="3" step="0.05" value="0.55"><span class="val" id="rolloffVal">0.55</span></label>
+    <label title="ISO 9613-1 공기흡수. 손 거리에선 물리적으로 0.1dB 미만이라 과장 배율 필요(1=거의 무음)">공기흡수 <input id="airExagg" type="range" min="0" max="3" step="0.05" value="1.2"><span class="val" id="airExaggVal">1.20</span></label>
+    <label title="6면을 계산해 청감상 중요한 상위 3개 반사만 렌더링. 벽마다 지연·게인·흡음이 실시간 반영됨">초기반사 <input id="reflAmt" type="range" min="0" max="2" step="0.02" value="0.7"><span class="val" id="reflAmtVal">0.70</span></label>
+    <label title="장애물 차폐(§7). 고역↓ 직접음↓ 반사↑">차폐 <input id="occlusion" type="range" min="0" max="1" step="0.01" value="0"><span class="val" id="occlusionVal">0.00</span></label>
+    <label title="소스 위치 보간(§9). 클수록 부드럽지만 반응 느려짐">위치 스무딩 <input id="smooth" type="range" min="0" max="1" step="0.01" value="0.25"><span class="val" id="smoothVal">0.25</span></label>
+    <label title="가상 방 크기(폭×높이×깊이 비율 유지). Sabine RT60 자동 계산">방 크기 <input id="roomScale" type="range" min="0.4" max="3" step="0.05" value="0.7"><span class="val" id="roomScaleVal">0.70</span></label>
+    <label title="벽 재질 → 흡음계수 → RT60(Sabine)">벽 재질
+      <select id="wallMat" style="font:inherit;padding:2px 4px;border-radius:6px">
+        <option value="concrete">콘크리트 .02</option>
+        <option value="plaster">석고 .03</option>
+        <option value="glass" selected>유리 .05</option>
+        <option value="wood">나무 .10</option>
+        <option value="carpet">카펫 .40</option>
+        <option value="curtain">커튼 .50</option>
+        <option value="acoustic">흡음재 .80</option>
+      </select></label>
+  </div>
+
+  <!-- ── 물 전용 ── -->
+  <div class="grp" id="grpWater">
+    <div class="ghead">🌊 물</div>
+    <label>배경 밝기 <input id="bedTone" type="range" min="0" max="1" step="0.01" value="0.7"><span class="val" id="bedToneVal">0.70</span></label>
+    <label>배경 볼륨 <input id="bedVol" type="range" min="0" max="1" step="0.01" value="1.0"><span class="val" id="bedVolVal">1.00</span></label>
+    <label>방울 밀도 <input id="density" type="range" min="0" max="1" step="0.01" value="0.5"><span class="val" id="densityVal">0.50</span></label>
+    <label>방울 볼륨 <input id="bubbleVol" type="range" min="0" max="1" step="0.01" value="0.7"><span class="val" id="bubbleVolVal">0.70</span></label>
+    <label>물살 휩쓸림 <input id="swirl" type="range" min="0" max="1" step="0.01" value="0.6"><span class="val" id="swirlVal">0.60</span></label>
+  </div>
+
+  <!-- ── 바람 전용 ── -->
+  <div class="grp" id="grpWind" hidden>
+    <div class="ghead">🌬️ 바람 — 공간 전체의 바람 + 손에서 생기는 국소 충돌음</div>
+    <label title="손이 없어도 공간 전체에 낮게 유지되는 바람">배경 바람 <input id="windBed" type="range" min="0" max="0.8" step="0.01" value="0.31"><span class="val" id="windBedVal">0.31</span></label>
+    <label title="정지한 손을 포함해 손 위치에서 들리는 바람의 기본 세기">손 충돌 <input id="windContact" type="range" min="0" max="3" step="0.01" value="3.00"><span class="val" id="windContactVal">3.00</span></label>
+    <label title="손바닥 정면의 묵직한 압력음과 손날의 얇은 고역 난류 사이의 대비">각도 반영 <input id="windAngle" type="range" min="0" max="1" step="0.01" value="0.74"><span class="val" id="windAngleVal">0.74</span></label>
+    <label title="손 이동·방향 전환·손가락 틈에서 생기는 거친 난류">난류 반응 <input id="windTurb" type="range" min="0" max="1.5" step="0.01" value="1.50"><span class="val" id="windTurbVal">1.50</span></label>
+  </div>
+
+  <!-- ── 연필 드로잉 전용 ── -->
+  <div class="grp" id="grpBark" hidden>
+    <div class="ghead">✏️ 연필 — 실제 종이 마찰 입자 + 앞쪽에 고정된 책상 공명</div>
+    <label title="선택적으로 유지되는 숲의 새·귀뚜라미 환경음">숲 배경 <input id="forestBed" type="range" min="0" max="1" step="0.01" value="0.28"><span class="val" id="forestBedVal">0.28</span></label>
+    <label title="원본 녹음의 서로 다른 구간을 독립적인 마찰 질감 후보로 비교">마찰 샘플
+      <select id="pencilRegion" style="font:inherit;padding:2px 4px;border-radius:6px">
+        <option value="-1">전체 혼합</option>
+        <option value="0">A — 밝고 고운 결 (6.75–7.60s)</option>
+        <option value="1">B — 둥글고 촘촘함 (9.15–10.05s)</option>
+        <option value="2">C — 가볍고 부드러움 (14.25–15.15s)</option>
+        <option value="3" selected>D — 짧고 날카로움 (18.2–20.7s)</option>
+        <option value="4">E — 거칠고 어두움 (22.15–22.95s)</option>
+      </select>
+    </label>
+    <label title="입자 길이와 샘플 위치 변화량">종이 질감 <input id="rough" type="range" min="0" max="1" step="0.01" value="0.48"><span class="val" id="roughVal">0.48</span></label>
+    <label title="책상으로 전달되는 낮은 공명 에너지">책상 몸통 <input id="body" type="range" min="0" max="1" step="0.01" value="0.98"><span class="val" id="bodyVal">0.98</span></label>
+    <label title="연필심과 종이 마찰의 고역량">연필 밝기 <input id="bright" type="range" min="0" max="1" step="0.01" value="1.00"><span class="val" id="brightVal">1.00</span></label>
+    <label title="고정된 책상 공명으로 보내는 양">책상 울림 <input id="reso" type="range" min="0" max="1" step="0.01" value="0.98"><span class="val" id="resoVal">0.98</span></label>
+    <label title="손 속도에 따라 겹치는 마찰 입자의 밀도">입자 밀도 <input id="slipRate" type="range" min="0" max="1" step="0.01" value="1.00"><span class="val" id="slipRateVal">1.00</span></label>
+    <label title="샘플 위치·길이·재생속도의 무작위 변화량">질감 변주 <input id="slipJit" type="range" min="0" max="1" step="0.01" value="0.16"><span class="val" id="slipJitVal">0.16</span></label>
+    <label title="연필이 종이에 닿는 가상 압력과 마찰 세기">필압 <input id="slipDepth" type="range" min="0" max="1" step="0.01" value="0.10"><span class="val" id="slipDepthVal">0.10</span></label>
+  </div>
+
+  <!-- ── 하프 전용 ── -->
+  <div class="grp" id="grpHarp" hidden>
+    <div class="ghead">🪉 하프 — 좌우로 현을 가로지를 때만 플럭됩니다 (수직 이동은 무음)</div>
+    <label title="낮으면 작은 좌우 움직임에도 현을 튕김">플럭 민감도 <input id="harpSens" type="range" min="0.5" max="2" step="0.05" value="1.00"><span class="val" id="harpSensVal">1.00</span></label>
+    <label title="현의 자연 감쇠 길이">울림 <input id="harpSustain" type="range" min="0" max="1" step="0.01" value="0.72"><span class="val" id="harpSustainVal">0.72</span></label>
+  </div>
+</div>
+<div id="status">대기 중…</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="./cipic_hrir_data.js"></script>
+
+<script>
+const video = document.getElementById('cam');
+const canvas = document.getElementById('overlay');
+const gtx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const roughEl = document.getElementById('rough'), pitchEl = document.getElementById('pitch');
+const volEl = document.getElementById('vol'), sensEl = document.getElementById('sens');
+// 슬라이더 목록(공통 / 물 / 연필 / 하프 / 바람). 여기 등록하면 값표시·기본값복원이 자동으로 붙는다.
+const SLIDERS = {
+  common: ['pitch','vol','sens','handConf','finger','hsMix','hsIld','hsShadow','revAmt','distAmt',
+           'itdAmt','lowWide','doppler','palmDir','hrtfMix',
+           'rolloff','airExagg','reflAmt','occlusion','smooth','roomScale'],
+  water : ['bedTone','bedVol','density','bubbleVol','swirl'],
+  bark  : ['forestBed','rough','body','bright','reso','slipRate','slipJit','slipDepth'],
+  harp  : ['harpSens','harpSustain'],
+  wind  : ['windBed','windContact','windAngle','windTurb'],
+};
+const ALL_SLIDERS = [...SLIDERS.common, ...SLIDERS.water, ...SLIDERS.bark, ...SLIDERS.harp, ...SLIDERS.wind];
+const DEFAULTS = {};   // HTML의 value= 를 기본값으로 기억 → ↺ 버튼이 여기로 되돌림
+ALL_SLIDERS.forEach(id=>{
+  const el=document.getElementById(id), out=document.getElementById(id+'Val');
+  DEFAULTS[id]=el.value;
+  out.textContent=(+el.value).toFixed(2);
+  el.addEventListener('input',()=>out.textContent=(+el.value).toFixed(2));
+});
+// ↺ 기본값: 음원 슬라이더는 HTML 기본값, 공간 슬라이더는 씬별 프리셋으로 되돌린다.
+document.getElementById('reset').addEventListener('click', ()=>{
+  const sceneSliders=timbre==='water-drops' ? SLIDERS.water
+    : timbre==='bark-friction' ? SLIDERS.bark
+    : timbre==='wind-flow' ? SLIDERS.wind : SLIDERS.harp;
+  const ids=[...SLIDERS.common, ...sceneSliders];
+  ids.forEach(id=>{
+    if(SCENE_SPATIAL_IDS.has(id)) return;
+    const el=document.getElementById(id);
+    el.value=DEFAULTS[id];
+    el.dispatchEvent(new Event('input'));   // 값표시 갱신 + 바다 배경 등 실시간 반영
+  });
+  if(timbre==='bark-friction'){
+    pencilRegionEl.value='3';
+    updatePencilRegion();
+  }
+  applySceneSpatialPreset(timbre);
+});
+// bedTone → 바닷소리 배경 밝기(로우패스 컷오프). 0=어두움(수중), 1=밝음.
+const bedToneToHz = v => 400*Math.pow(2, v*5.3);   // presence session과 동일: 약 400Hz ~ 16kHz
+const fingerEl=document.getElementById('finger');
+const handConfEl=document.getElementById('handConf');
+const bedToneEl=document.getElementById('bedTone'), bedVolEl=document.getElementById('bedVol');
+const densityEl=document.getElementById('density'), bubbleVolEl=document.getElementById('bubbleVol');
+const swirlEl=document.getElementById('swirl');
+// 연필·책상 튜닝 슬라이더
+const bodyEl=document.getElementById('body'), brightEl=document.getElementById('bright');
+const resoEl=document.getElementById('reso'), slipRateEl=document.getElementById('slipRate');
+const slipJitEl=document.getElementById('slipJit'), slipDepthEl=document.getElementById('slipDepth');
+const forestBedEl=document.getElementById('forestBed');
+const pencilRegionEl=document.getElementById('pencilRegion');
+const harpSensEl=document.getElementById('harpSens');
+const harpSustainEl=document.getElementById('harpSustain');
+const windBedEl=document.getElementById('windBed'), windContactEl=document.getElementById('windContact');
+const windAngleEl=document.getElementById('windAngle'), windTurbEl=document.getElementById('windTurb');
+const grpWater=document.getElementById('grpWater'), grpBark=document.getElementById('grpBark');
+const grpHarp=document.getElementById('grpHarp'), grpWind=document.getElementById('grpWind');
+// 공간(head shadow) 슬라이더
+const hsMixEl=document.getElementById('hsMix'), hsIldEl=document.getElementById('hsIld');
+const hsShadowEl=document.getElementById('hsShadow');
+const revAmtEl=document.getElementById('revAmt'), distAmtEl=document.getElementById('distAmt');
+// ITD / 근접 저역 분리 / 도플러
+const itdAmtEl=document.getElementById('itdAmt'), lowWideEl=document.getElementById('lowWide');
+const dopplerEl=document.getElementById('doppler');
+const palmDirEl=document.getElementById('palmDir');
+const hrtfMixEl=document.getElementById('hrtfMix');
+// 확장 엔진 컨트롤
+const engineOnEl=document.getElementById('engineOn'), distModelEl=document.getElementById('distModel');
+const rolloffEl=document.getElementById('rolloff'), airExaggEl=document.getElementById('airExagg');
+const reflAmtEl=document.getElementById('reflAmt'), occlusionEl=document.getElementById('occlusion');
+const smoothEl=document.getElementById('smooth'), roomScaleEl=document.getElementById('roomScale');
+const wallMatEl=document.getElementById('wallMat');
+// 방 크기·재질 변경 → 룸 모델 + Sabine RT60 재계산 → late reverb IR 재생성
+function applyRoomModel(){
+  const s=+roomScaleEl.value;
+  currentRoom=makeRoom(4*s, 3*s, 6*s);          // 기본 4×3×6m (요청 예시)
+  currentAbsorb=WALL_ABSORB[wallMatEl.value] ?? 0.10;
+  currentRT60=sabineRT60(currentRoom, currentAbsorb);
+  rebuildLateIR();                               // §6 RT60 반영
+}
+roomScaleEl.addEventListener('input', applyRoomModel);
+wallMatEl.addEventListener('change', applyRoomModel);
+
+// 씬별 공간 기본값. 물=확산된 수중, 연필=눈앞 책상의 직접음, 하프=목재 오케스트라 홀.
+const SCENE_SPATIAL_IDS=new Set(['hsMix','hsIld','hsShadow','revAmt','distAmt','itdAmt','lowWide','doppler','palmDir','hrtfMix',
+  'engineOn','distModel','rolloff','airExagg','reflAmt','occlusion','smooth','roomScale','wallMat']);
+const SCENE_SPATIAL_PRESETS={
+  'water-drops':{
+    hsMix:0.42, hsIld:0.77, hsShadow:0.50, revAmt:0.78, distAmt:0.45, itdAmt:0.55, lowWide:0.28,
+    doppler:0.35, palmDir:0.24, hrtfMix:0.12,
+    engineOn:true, distModel:'inverse', rolloff:0.20, airExagg:0.35, reflAmt:0.18, occlusion:0.00,
+    smooth:0.35, roomScale:2.20, wallMat:'curtain',
+  },
+  'bark-friction':{
+    hsMix:0.40, hsIld:0.35, hsShadow:0.55, revAmt:0.02, distAmt:0.62, itdAmt:0.85, lowWide:0.18,
+    doppler:0.20, palmDir:0.35, hrtfMix:0.28,
+    engineOn:true, distModel:'inverse', rolloff:0.60, airExagg:0.20, reflAmt:0.00, occlusion:0.00,
+    smooth:0.22, roomScale:3.00, wallMat:'acoustic',
+  },
+  'harp-strings':{
+    hsMix:0.56, hsIld:0.58, hsShadow:0.52, revAmt:1.08, distAmt:0.34, itdAmt:0.82, lowWide:0.42,
+    doppler:0.15, palmDir:0.30, hrtfMix:0.16,
+    engineOn:true, distModel:'inverse', rolloff:0.46, airExagg:0.45, reflAmt:1.08, occlusion:0.00,
+    smooth:0.28, roomScale:1.40, wallMat:'wood',
+  },
+  'wind-flow':{
+    hsMix:0.48, hsIld:0.64, hsShadow:0.52, revAmt:0.08, distAmt:0.38, itdAmt:0.82, lowWide:0.22,
+    doppler:0.00, palmDir:0.00, hrtfMix:0.16,
+    engineOn:true, distModel:'inverse', rolloff:1.35, airExagg:1.40, reflAmt:2.00, occlusion:0.51,
+    smooth:0.54, roomScale:2.45, wallMat:'concrete',
+  },
+};
+// 공간 변화와 분리해서, 씬의 재질감에 직접 영향을 주는 최소 음원 기본값만 둔다.
+const SCENE_TIMBRE_PRESETS={
+  'water-drops':{vol:0.75, bedVol:0.75},
+  'bark-friction':{
+    pitch:0.45, vol:0.75, sens:1.00, handConf:0.70, finger:0.90,
+    forestBed:0.28, pencilRegion:3, rough:0.48, body:0.98, bright:1.00,
+    reso:0.98, slipRate:1.00, slipJit:0.16, slipDepth:0.10,
+  },
+  'wind-flow':{vol:0.95, finger:0.35, windBed:0.31, windContact:3.00, windAngle:0.74, windTurb:1.50},
+};
+function applySceneSpatialPreset(scene){
+  const preset=SCENE_SPATIAL_PRESETS[scene];
+  if(!preset) return;
+  for(const [id,value] of Object.entries(preset)){
+    const el=document.getElementById(id);
+    if(!el) continue;
+    if(el.type==='checkbox') el.checked=!!value;
+    else el.value=String(value);
+    const out=document.getElementById(id+'Val');
+    if(out) out.textContent=(+el.value).toFixed(2);
+  }
+  for(const [id,value] of Object.entries(SCENE_TIMBRE_PRESETS[scene]||{})){
+    const el=document.getElementById(id), out=document.getElementById(id+'Val');
+    if(!el) continue;
+    el.value=String(value);
+    if(out) out.textContent=(+el.value).toFixed(2);
+  }
+  applyRoomModel();
+  // 같은 씬 버튼을 다시 눌렀을 때도 바다 배경의 프리셋 볼륨을 즉시 반영한다.
+  if(oceanGain && ctx){
+    updateOceanForTimbre();
+    if(oceanLP) oceanLP.frequency.setTargetAtTime(bedToneToHz(+bedToneEl.value),ctx.currentTime,0.05);
+  }
+  updateWindForTimbre();
+  updateForestForTimbre();
+  updatePencilRegion();
+}
+// '배경 볼륨' 슬라이더 → 바닷소리 루프 게인 (실시간). 나무껍질 음색이면 무음 유지.
+bedVolEl.addEventListener('input',()=>{ if(oceanGain) oceanGain.gain.setTargetAtTime(timbre==='water-drops'?+bedVolEl.value:0, ctx.currentTime, 0.05); });
+// '배경 밝기' 슬라이더 → 바닷소리 로우패스 컷오프 (실시간).
+bedToneEl.addEventListener('input',()=>{ if(oceanLP) oceanLP.frequency.setTargetAtTime(bedToneToHz(+bedToneEl.value), ctx.currentTime, 0.05); });
+windBedEl.addEventListener('input', updateWindForTimbre);
+forestBedEl.addEventListener('input', updateForestForTimbre);
+pencilRegionEl.addEventListener('change',updatePencilRegion);
+function resize(){ canvas.width=innerWidth; canvas.height=innerHeight; }
+addEventListener('resize', resize); resize();
+
+// ============================================================
+// 1€ Filter — 손 속도 평활화
+// ============================================================
+class OneEuro {
+  // minCut 높을수록 반응 빠름(지연↓), beta 높을수록 빠른 움직임에 더 즉각적
+  constructor(minCut=3.5, beta=0.05){ this.minCut=minCut; this.beta=beta; this.x=null; this.dx=0; this.t=null; }
+  _a(c,dt){ const tau=1/(2*Math.PI*c); return 1/(1+tau/dt); }
+  filter(x,t){
+    if(this.t==null){ this.t=t; this.x=x; return x; }
+    let dt=(t-this.t)/1000; if(dt<=0) dt=1/120;
+    const dx=(x-this.x)/dt, aD=this._a(1.0,dt);
+    this.dx=aD*dx+(1-aD)*this.dx;
+    const cut=this.minCut+this.beta*Math.abs(this.dx), a=this._a(cut,dt);
+    this.x=a*x+(1-a)*this.x; this.t=t; return this.x;
+  }
+}
+
+// ============================================================
+// 나무껍질 마찰 워클릿 (drag_friction 엔진 변형)
+//   여기(문지름 노이즈) + 모달 공명 색칠. 나무껍질용으로 톤 조정.
+//   파라미터: speed(0~1 속도), rough, pitch, pan(패닝은 노드에서)
+// ============================================================
+const WORKLET = `
+class BarkFriction extends AudioWorkletProcessor {
+  static get parameterDescriptors(){ return [
+    {name:'drive', defaultValue:0, minValue:0, maxValue:1, automationRate:'k-rate'},  // 속도(여기 세기)
+    {name:'rough', defaultValue:0.7, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'pitch', defaultValue:0.30, minValue:0, maxValue:1, automationRate:'k-rate'},
+    // --- 튜닝용 추가 파라미터 ---
+    {name:'slipRate',  defaultValue:0.45, minValue:0, maxValue:1, automationRate:'k-rate'}, // 걸림 빈도(평균)
+    {name:'slipJit',   defaultValue:0.85, minValue:0, maxValue:1, automationRate:'k-rate'}, // 걸림 불규칙도 ★드르륵 제거
+    {name:'slipDepth', defaultValue:0.55, minValue:0, maxValue:1, automationRate:'k-rate'}, // 걸림 세기
+    {name:'body',      defaultValue:0.55, minValue:0, maxValue:1, automationRate:'k-rate'}, // 저역 몸통(울림)
+    {name:'bright',    defaultValue:0.35, minValue:0, maxValue:1, automationRate:'k-rate'}, // 밝기(여기 노이즈 고역)
+    {name:'reso',      defaultValue:0.36, minValue:0, maxValue:1, automationRate:'k-rate'}, // 공명 비중
+  ]; }
+  constructor(){
+    super(); this.sr=sampleRate;
+    // 나무껍질: 저역 몸통 위주. 비화음적 3모드(전체적으로 한 옥타브 낮춤).
+    // 기존 320/720/1450 → 저음 요청 반영해 하향. body 파라미터로 저역 2모드를 더 키움.
+    this.modes=[
+      {f:150,q:8,z1:0,z2:0,g:0.62},
+      {f:355,q:7,z1:0,z2:0,g:0.46},
+      {f:790,q:5,z1:0,z2:0,g:0.22},
+    ];
+    this.lp=0; this.lp2=0; this.env=0;
+    this.grit=0; this.gritT=0;
+    // === stick-slip: 주기적 위상 램프(=드르륵 원인) 제거, 이벤트 기반으로 ===
+    // 다음 걸림까지 남은 샘플 수. 매 이벤트마다 난수로 새로 뽑아 "박자"를 없앤다.
+    this.slipCd=0;          // countdown (samples)
+    this.slipAmp=0;         // 현재 걸림 그레인 진폭(감쇠)
+    this.slipDec=0.999;     // 그레인 감쇠 계수
+    this.dcz=0;             // DC 제거용
+  }
+  process(_,outs,p){
+    const out=outs[0][0]; if(!out) return true;
+    const drive=p.drive[0], rough=p.rough[0], pitch=p.pitch[0];
+    const slipRate=p.slipRate[0], slipJit=p.slipJit[0], slipDepth=p.slipDepth[0];
+    const body=p.body[0], bright=p.bright[0], reso=p.reso[0];
+    const pmul=Math.pow(2, pitch-0.5);            // 0.7~1.4배
+    // 공명 계수 — body가 클수록 저역 2모드 게인↑, 최고역 모드 게인↓ (어두운 몸통)
+    for(let k=0;k<this.modes.length;k++){
+      const m=this.modes[k];
+      const f=Math.min(m.f*pmul, this.sr*0.45);
+      const w=2*Math.PI*f/this.sr;
+      m.r=Math.exp(-Math.PI*f/(m.q*this.sr));
+      m.a1=2*m.r*Math.cos(w); m.a2=-m.r*m.r; m.norm=1-m.r;
+      // k=0,1은 저역 / k=2는 고역. body로 무게중심 이동.
+      m.gain = (k<2) ? m.g*(0.55+body*1.15) : m.g*(1.25-body*0.95);
+    }
+    // 여기 노이즈 대역: bright가 낮을수록 어두운(저역) 문지름 소리.
+    const lpCut=Math.min(0.6, (0.012+bright*0.055+drive*(0.06+bright*0.30))*pmul);
+    // 껍질의 불규칙한 걸림 세기
+    const stick=(0.25+rough*0.45)*slipDepth*2;
+    // 평균 걸림 간격(샘플). slipRate·drive가 높을수록 촘촘.
+    const meanHz = (6+slipRate*60) * (0.25+drive*1.6);
+    const meanSamp = this.sr/Math.max(1, meanHz);
+    for(let i=0;i<out.length;i++){
+      // 여기 = 지속 필터드 노이즈
+      const white=Math.random()*2-1;
+      this.lp+=lpCut*(white-this.lp); this.lp2+=lpCut*(this.lp-this.lp2);
+      let exc=this.lp2*1.6;
+      // === stick-slip: 이벤트 기반 + 간격 난수화 ===
+      // slipJit=0 → 균일 간격(옛 드르륵), 1 → 지수분포에 가까운 완전 불규칙.
+      // 규칙적 패턴이 안 생기도록 간격 자체를 매번 새로 뽑는다.
+      this.slipCd -= 1;
+      if(this.slipCd<=0){
+        // 균일(1) ↔ 지수분포(-ln U) 를 slipJit으로 보간. 지수분포 = 무기억성 = 박자 없음.
+        const u=Math.max(1e-6, Math.random());
+        const expo=-Math.log(u);                       // 평균 1, 분산 큼
+        const shape=(1-slipJit)*1 + slipJit*expo;
+        this.slipCd = Math.max(8, meanSamp*shape);
+        // 그레인: 걸림 하나가 짧게 "탁" 하고 감쇠. 길이도 난수.
+        const durMs = 3 + Math.random()*(6+rough*14);
+        this.slipDec = Math.exp(-1/(durMs*0.001*this.sr));
+        this.slipAmp = (0.45+Math.random()*0.55);
+      }
+      this.slipAmp *= this.slipDec;
+      // 걸림 = 여기 진폭을 순간적으로 눌렀다 놓음(마찰의 stick 구간)
+      exc *= 1 - stick*0.5*this.slipAmp;
+      // 거친 그릿(껍질 조각) — rough에 강하게 연동
+      if(this.gritT<=0){
+        if(Math.random()<0.0012*(0.3+drive)*rough){ this.grit=(Math.random()*2-1)*0.5*rough; this.gritT=180; }
+        else this.grit*=0.9;
+      } else { this.gritT--; this.grit*=0.9; }
+      exc+=this.grit*0.6;
+      // 광대역 거칠기
+      exc+=(Math.random()*2-1)*rough*rough*0.14*Math.abs(exc);
+      // 공명 색칠
+      let res=0;
+      for(let k=0;k<this.modes.length;k++){
+        const m=this.modes[k]; const x=exc*m.gain*m.norm;
+        const y=x+m.a1*m.z1+m.a2*m.z2; m.z2=m.z1; m.z1=y; res+=y;
+      }
+      // reso: 공명(울림) vs 원 노이즈 비중.
+      let s=exc*(0.85-reso*0.55)+res*(0.5+reso*2.0);
+      // 활성 엔벨로프 — attack 매우 빠르게(즉각), release는 약간 부드럽게
+      const target=drive;
+      this.env+=(target-this.env)*(target>this.env?0.08:0.012);
+      s*=this.env*0.42;
+      // DC 제거(저역 강조 시 오프셋 누적 방지)
+      this.dcz += 0.0008*(s-this.dcz); s -= this.dcz;
+      out[i]=Math.tanh(s);
+    }
+    return true;
+  }
+}
+registerProcessor('bark-friction-legacy', BarkFriction);
+
+// ============================================================
+// 실제 연필 녹음을 사용하는 거리 구동 granular 엔진.
+// 출력 0은 손끝의 마찰음, 출력 1은 고정된 책상 공명용 excitation이다.
+// ============================================================
+class PencilFriction extends AudioWorkletProcessor {
+  static get parameterDescriptors(){ return [
+    {name:'drive', defaultValue:0, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'rough', defaultValue:0.62, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'pitch', defaultValue:0.30, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'slipRate', defaultValue:0.58, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'slipJit', defaultValue:0.78, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'slipDepth', defaultValue:0.58, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'body', defaultValue:0.42, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'bright', defaultValue:0.58, minValue:0, maxValue:1, automationRate:'k-rate'},
+    {name:'reso', defaultValue:0.40, minValue:0, maxValue:1, automationRate:'k-rate'},
+  ]; }
+  constructor(){
+    super();
+    this.sr=sampleRate;
+    this.sample=null;
+    // 비교가 쉽도록 0.8~1초 안팎의 짧은 질감 조각을 사용한다.
+    // D는 기존 후보를 유지하고 A/B/C/E만 새 구간으로 교체했다.
+    this.regions=new Float32Array([
+      6.75,7.60, 9.15,10.05, 14.25,15.15, 18.20,20.65, 22.15,22.95
+    ]);
+    this.N=20;
+    this.grains=[];
+    for(let i=0;i<this.N;i++) this.grains.push({on:false,pos:0,rate:1,age:0,len:1,amp:0});
+    this.nextGrain=0;
+    this.spawnPhase=0;
+    this.regionChoice=-1;
+    this.env=0;
+    this.lp=0;
+    this.dc=0;
+    this.seed=0x6d2b79f5;
+    this.window=new Float32Array(2048);
+    for(let i=0;i<this.window.length;i++){
+      const s=Math.sin(Math.PI*i/(this.window.length-1));
+      this.window[i]=s*s;
+    }
+    this.port.onmessage=e=>{
+      const d=e.data;
+      if(d&&d.type==='sample'&&d.samples instanceof Float32Array) this.sample=d.samples;
+      else if(d&&d.type==='region'){
+        const index=d.index|0;
+        this.regionChoice=index>=0&&index<5 ? index : -1;
+      }
+    };
+  }
+  _rand(){
+    let x=this.seed|0;
+    x^=x<<13; x^=x>>>17; x^=x<<5;
+    this.seed=x|0;
+    return (x>>>0)/4294967296;
+  }
+  _spawn(drive,rough,pitch,jitter){
+    const data=this.sample;
+    if(!data||data.length<4096) return;
+    const g=this.grains[this.nextGrain];
+    this.nextGrain=(this.nextGrain+1)%this.N;
+    const region=this.regionChoice>=0 ? this.regionChoice : (this._rand()*5)|0;
+    const startSec=this.regions[region*2];
+    const endSec=this.regions[region*2+1];
+    // 원본에 녹음된 글씨 획의 리듬이 남지 않도록 10~28ms 미세 입자만 사용한다.
+    const duration=0.010+(1-drive)*0.012+this._rand()*0.006*(0.25+rough);
+    const pitchMul=Math.pow(2,(pitch-0.5)*0.40);
+    // 손 속도 0→1에서 최대 +36 semitones(3옥타브). 저속은 완만하고 고속에서
+    // 크게 벌어지는 곡선으로 실제 샘플 읽기 속도를 최대 8배까지 올린다.
+    // 속도를 올려 종이를 빠르게 긁을수록 마찰 스펙트럼 전체가 위로 이동한다.
+    const speedPitch=Math.pow(2,Math.pow(drive,1.15)*3.00);
+    const rate=pitchMul*speedPitch*(0.97+(this._rand()-0.5)*0.08*jitter);
+    const len=Math.max(384,Math.min(1536,(duration*this.sr)|0));
+    const lastStart=Math.max(startSec,endSec-len*rate/this.sr-0.005);
+    const offset=startSec+this._rand()*Math.max(0.001,lastStart-startSec);
+    g.on=true;
+    g.pos=offset*this.sr;
+    g.rate=rate;
+    g.age=0;
+    g.len=len;
+    g.amp=0.72+this._rand()*0.38;
+  }
+  process(_,outs,p){
+    const out=outs[0][0];
+    const desk=outs[1]&&outs[1][0];
+    if(!out) return true;
+    const drive=p.drive[0], rough=p.rough[0], pitch=p.pitch[0];
+    const density=p.slipRate[0], jitter=p.slipJit[0], pressure=p.slipDepth[0];
+    const body=p.body[0], bright=p.bright[0], reso=p.reso[0];
+    const data=this.sample;
+    // 매우 짧은 Hann 입자들이 서로 2~3개씩 겹쳐 연속적인 종이 마찰이 되게 한다.
+    const spawnRate=drive>0.008 ? 65+density*45+drive*(110+density*110) : 0;
+    const attack=1-Math.exp(-1/(0.007*this.sr));
+    const release=1-Math.exp(-1/(0.075*this.sr));
+    // 느릴 때는 종이의 어두운 마찰만 남기고, 빠를수록 원본의 15kHz대 입자까지 연다.
+    const toneDrive=Math.pow(drive,0.82);
+    const cutoff=Math.min(16500,1800+bright*4200+toneDrive*(9000+bright*3500));
+    const lpA=1-Math.exp(-2*Math.PI*cutoff/this.sr);
+    // 저속을 크게 들리게 만들던 0.72 지수를 반대로 세운다.
+    // drive=0.2는 최대속도 대비 약 8%, 0.5는 약 34%만 출력된다.
+    const target=drive>0.008 ? Math.pow(drive,1.55)*(0.56+pressure*0.76) : 0;
+    for(let i=0;i<out.length;i++){
+      this.env+=(target-this.env)*(target>this.env?attack:release);
+      this.spawnPhase+=spawnRate/this.sr;
+      if(this.spawnPhase>=1){
+        this.spawnPhase-=1;
+        this._spawn(drive,rough,pitch,jitter);
+      }
+      let sum=0,active=0;
+      if(data){
+        for(let k=0;k<this.N;k++){
+          const g=this.grains[k];
+          if(!g.on) continue;
+          const idx=g.pos|0;
+          if(g.age>=g.len||idx<0||idx+1>=data.length){ g.on=false; continue; }
+          const frac=g.pos-idx;
+          const sample=data[idx]+(data[idx+1]-data[idx])*frac;
+          const wi=Math.min(2047,(g.age*2047/g.len)|0);
+          sum+=sample*this.window[wi]*g.amp;
+          g.pos+=g.rate;
+          g.age++;
+          active++;
+        }
+      }
+      if(active>1) sum/=Math.sqrt(active*0.72);
+      this.lp+=lpA*(sum-this.lp);
+      let direct=this.lp*this.env*(0.92+rough*0.16);
+      this.dc+=0.0012*(direct-this.dc);
+      direct-=this.dc;
+      out[i]=Math.max(-1,Math.min(1,direct));
+      if(desk) desk[i]=direct*reso*(0.12+body*0.34);
+    }
+    return true;
+  }
+}
+registerProcessor('bark-friction', PencilFriction);
+
+// ============================================================
+// 물(기포) 워클릿 — Nemisindo 물 모델과 같은 원리
+//   물소리 = 크기가 랜덤한 기포들이 각각 짧은 "삐융↗"(음 상승+지수감쇠 사인)
+//   을 내는 것의 중첩. drive(손 속도) → 기포 발생 밀도(Stream Speed).
+//   파라미터 기본값은 Nemisindo 스크린샷 반영.
+// ============================================================
+class WaterDrops extends AudioWorkletProcessor {
+  static get parameterDescriptors(){ return [
+    {name:'drive', defaultValue:0, minValue:0, maxValue:1, automationRate:'k-rate'},    // 손 속도 → 기포 밀도
+    {name:'pitch', defaultValue:0.45, minValue:0, maxValue:1, automationRate:'k-rate'}, // 기포 음높이
+    {name:'bedTone', defaultValue:0.30, minValue:0, maxValue:1, automationRate:'k-rate'},// 배경음 음높이(밝기)
+    {name:'bedVol', defaultValue:0.6, minValue:0, maxValue:1, automationRate:'k-rate'},  // 배경음 볼륨
+    {name:'density', defaultValue:0.5, minValue:0, maxValue:1, automationRate:'k-rate'}, // 물살 방울 밀도
+    {name:'bubbleVol', defaultValue:0.7, minValue:0, maxValue:1, automationRate:'k-rate'},// 방울 볼륨
+    {name:'swirl', defaultValue:0.6, minValue:0, maxValue:1, automationRate:'k-rate'},   // 물 휩쓸림(난류) 볼륨
+  ]; }
+  constructor(){
+    super(); this.sr=sampleRate;
+    // 동시에 울릴 수 있는 기포 보이스 풀
+    this.N=24; this.v=[];
+    for(let i=0;i<this.N;i++) this.v.push({on:false, ph:0, f:0, df:0, a:0, dec:0, atk:1, atkInc:1});
+    this.spawnPhase=0;
+    // Nemisindo 값 반영
+    this.dropMin=1.32; this.dropMax=19.99; this.pitchRise=0.13; this.riseLimit=0.78;
+    // 기포 로우패스 상태 (고음 노이즈 제거)
+    this.blp1=0; this.blp2=0; this.blp3=0;
+    this.hp=0;   // 저역 제거용 하이패스 상태
+    // === 물 휩쓸림(난류) 층: 손 속도로 구동되는 연속 노이즈 "쏴~" ===
+    this.swLP1=0; this.swLP2=0; this.swHP=0; this.swEnv=0;   // 난류 필터/엔벨로프 상태
+    // === 배경 저음 물소리 (손과 완전 분리, 상시 흐름) ===
+    // 브라운 노이즈(적분 노이즈)를 여러 단 저역통과 → "쏴~" 없는 저음 수중음.
+    this.brown=0;
+    this.bLP1=0; this.bLP2=0; this.bLP3=0;
+    // 아주 느린 진폭 스웰들(위상 다름) = 규칙적 리듬 없이 뭉근히 출렁이는 흐름.
+    this.sw1=Math.random(); this.sw2=Math.random(); this.sw3=Math.random();
+    // 저음 공명(수중 "웅" 감) — 흐르는 노이즈를 통과시킬 밴드.
+    this.rz1=0; this.rz2=0;
+  }
+  _spawn(amp){
+    // 빈 보이스 찾기
+    let s=null; for(const x of this.v){ if(!x.on){ s=x; break; } }
+    if(!s){ // 다 차면 가장 오래된(진폭 작은) 것 재사용
+      s=this.v.reduce((m,x)=> x.a<m.a?x:m, this.v[0]);
+    }
+    // === 과거의 "물방울 느낌" 복원 + 우웅 방지 ===
+    // 우웅 원인은 (a)한 대역(160~320Hz) 몰림 (b)빽빽한 겹침 뿐이었음.
+    // → 음색 파라미터(기준주파수/처프/지속)는 과거 그대로, 크기는 "균등분포"로 넓게 펴서
+    //   특정 대역 몰림만 방지. (과거는 max(rand,rand)로 큰기포=저역에 몰려서 우웅)
+    const bias = this._drive || 0;
+    let r = Math.random();                       // 균등분포 → 주파수 골고루 분산
+    r = r * (1 - bias*0.35);                      // 과거값
+    if(this._deep) r = 0.85 + 0.15*Math.random();
+    const dmax = this._deep ? 22 : 11;            // 과거 크기 범위 복원
+    const size = this.dropMin + r*(dmax-this.dropMin);
+    // presence session과 동일한 기포 음역. 과도하게 밝아지는 것을 막는다.
+    const fmax = this._deep ? (this._deepBright || 850) : 1150;
+    s.f = Math.min(fmax, (1400 / size) * this._pmul);
+    s.ph=0; s.on=true;
+    s.atk=0; s.atkInc = 1/(0.002*this.sr);        // 과거 2ms 페이드인
+    s.a = amp*(0.4+Math.random()*0.4);
+    const durMs = 10 + (size/this.dropMax)*45;    // 과거 지속(10~55ms)
+    s.dec = Math.exp(-1/(durMs*0.001*this.sr));
+    // 과거 처프값 복원(뽀글~ 특유의 부드러운 상승).
+    s.rise = 1 + this.pitchRise*this.riseLimit*0.6;
+    s.df = Math.pow(s.rise, 1/(durMs*0.001*this.sr));
+  }
+  process(_,outs,p){
+    const out=outs[0][0]; if(!out) return true;
+    const drive=p.drive[0], pitch=p.pitch[0];
+    const bedTone=p.bedTone[0], bedVol=p.bedVol[0], density=p.density[0], bubbleVol=p.bubbleVol[0];
+    const swirl=(p.swirl?p.swirl[0]:0.6);
+    this._pmul=Math.pow(2, pitch-0.5);
+    this._drive=drive;                  // _spawn에서 손 속도로 기포 크기 편향
+    // 손짓 기포 밀도: 과거 260은 빽빽해서 겹침=우웅. 100으로 성기게 → 우웅 방지하며 과거 음색.
+    const rate = (drive*100) * (0.4 + density*1.6);
+    const inc = rate/this.sr;
+    for(let i=0;i<out.length;i++){
+      // --- 손짓 기포 ---
+      this.spawnPhase += inc;
+      while(this.spawnPhase>=1){
+        this.spawnPhase-=1;
+        const amp = (0.1 + 0.9*drive) * (0.6 + 0.4*Math.random()) * bubbleVol * 1.9;
+        this._spawn(amp);
+      }
+      // --- 기포 보이스 합산 (손짓 소리만) ---
+      let bub=0;
+      for(const b of this.v){
+        if(!b.on) continue;
+        b.ph += b.f/this.sr; if(b.ph>=1) b.ph-=1;
+        if(b.atk<1){ b.atk += b.atkInc; if(b.atk>1) b.atk=1; }
+        bub += Math.sin(2*Math.PI*b.ph)*b.a*b.atk;
+        b.a *= b.dec; b.f *= b.df;
+        if(b.a<0.0008) b.on=false;
+      }
+      // 과거처럼 원음 위주(선명). 최고역만 살짝 완화.
+      this.blp1 += 0.5*(bub - this.blp1);
+      let s = bub*0.8 + this.blp1*0.2;              // 과거 믹스 복원
+      // 우웅 재발 보험: 아주 낮은 저역(~90Hz)만 살짝 감산. 음색엔 거의 영향 없음.
+      this.hp += 0.012*(s - this.hp);
+      s = s - this.hp*0.5;
+
+      // === 물 휩쓸림(난류) 층: 손 속도로 구동되는 "저음" 연속 노이즈 (물이 뭉근히 밀림) ===
+      // 나무 쓸림처럼 밝으면 안 됨 → 컷오프를 아주 낮게(저역 물덩어리 이동감).
+      this.swEnv += 0.002*(drive - this.swEnv);
+      const white2 = Math.random()*2-1;
+      // 저역통과 3단, 컷오프 아주 낮게(속도로 살짝만 상승) → 깊은 "우르르/쏴" 저음.
+      const cut = 0.006 + this.swEnv*0.02;         // ~45~200Hz (저음 물살)
+      this.swLP1 += cut*(white2 - this.swLP1);
+      this.swLP2 += cut*(this.swLP1 - this.swLP2);
+      this.swHP  += cut*(this.swLP2 - this.swHP);
+      const turbo = this.swHP;                     // 3단 저역통과 = 아주 어두운 저음 노이즈
+      // 난류 볼륨: 속도²에 비례. 고속에서 저역이 과도해 "쿠구구구"로 뭉치지 않게 상한을 낮춘다.
+      s += turbo * this.swEnv * this.swEnv * swirl * 3.8;
+
+      out[i]=Math.tanh(s*0.75);
+    }
+    return true;
+  }
+}
+registerProcessor('water-drops', WaterDrops);
+
+// ============================================================
+// 하프 워클릿 — 다성 Karplus-Strong 현 + 공명 모드.
+// 실제 멀티샘플을 넣기 전에도 현의 어택·감쇠·공명을 유지하는 경량 물리 모델이다.
+// 이벤트는 port 메시지로만 발생하므로, 수직 손 움직임은 이 프로세서에 도달하지 않는다.
+// ============================================================
+class HarpStrings extends AudioWorkletProcessor {
+  constructor(){
+    super(); this.sr=sampleRate; this.voices=[];
+    for(let i=0;i<18;i++) this.voices.push({on:false, a:0, delay:0, buf:null});
+    this.port.onmessage=(e)=>{ if(e.data?.type==='pluck') this.pluck(e.data); };
+  }
+  pluck(m){
+    const f=440*Math.pow(2, ((m.note||60)-69)/12);
+    // 너무 짧은 지연선은 고음에서 거칠어지므로 28 samples 이상으로 유지한다.
+    const n=Math.max(28, Math.round(this.sr/f));
+    let v=this.voices.find(x=>!x.on);
+    if(!v) v=this.voices.reduce((quiet,x)=>x.a<quiet.a?x:quiet, this.voices[0]);
+    const bright=Math.max(0,Math.min(1,m.bright??0.68));
+    const vel=Math.max(0.08,Math.min(1,m.velocity??0.6));
+    const buf=new Float32Array(n);
+    // 손끝이 현을 미는 짧은 유색 잡음: 밝을수록 고역이 남는다.
+    let color=0;
+    for(let i=0;i<n;i++){
+      const white=Math.random()*2-1;
+      color += (0.12+bright*0.70)*(white-color);
+      buf[i]=(color*(0.35+bright*0.65) + white*(0.14+bright*0.28))*vel;
+    }
+    v.on=true; v.a=vel; v.buf=buf; v.i=0; v.last=0;
+    v.loss=0.9928 + (m.sustain??0.72)*0.0062 - Math.min(0.0018, f/15000000);
+    v.bright=bright; v.f=f; v.delay=Math.max(0,Math.round((m.delay||0)*this.sr));
+    v.modalPh=0; v.modalAmp=vel*(0.08+bright*0.16);
+    v.modalDec=Math.exp(-1/(this.sr*(0.28+(m.sustain??0.72)*1.6)));
+  }
+  process(ins, outs){
+    const out=outs[0][0]; if(!out) return true;
+    // 실제 WAV 샘플은 메인 스레드에서 이 노드의 입력으로 보낸다.
+    // 물리모델은 샘플 로딩 실패 시의 폴백으로만 같은 출력에 더해진다.
+    const inBus=ins[0], inL=inBus?.[0], inR=inBus?.[1];
+    for(let s=0;s<out.length;s++){
+      let sample=(inL?inL[s]:0)+(inR?inR[s]:0);
+      if(inL&&inR) sample*=0.5; // 스테레오 녹음은 기존 모노 공간화 체인으로 보내기 전 다운믹스
+      let sum=0;
+      for(const v of this.voices){
+        if(!v.on) continue;
+        if(v.delay>0){ v.delay--; continue; }
+        const i=v.i, j=(i+1)%v.buf.length;
+        const x=v.buf[i], next=v.buf[j];
+        // 평균화된 피드백이 하프 현의 긴 자연 감쇠를 만든다.
+        v.buf[i]=(0.5*(x+next) + (Math.random()*2-1)*0.0008*v.bright)*v.loss;
+        v.i=j;
+        v.modalPh += 2*Math.PI*v.f*(2.01+v.bright*0.015)/this.sr;
+        if(v.modalPh>Math.PI*2) v.modalPh-=Math.PI*2;
+        const body=Math.sin(v.modalPh)*v.modalAmp;
+        v.modalAmp*=v.modalDec;
+        v.a*=0.999992;
+        sum += (x*0.92+body)*v.a;
+        if(v.a<0.0012){ v.on=false; v.buf=null; }
+      }
+      // 실제 녹음 샘플에 물리모델용 tanh를 걸면 어택이 뭉개지고 왜곡된다.
+      // 폴백 물리현만 부드럽게 제한하고, WAV는 원음 그대로 공간 체인으로 보낸다.
+      out[s]=Math.max(-1, Math.min(1, sample+Math.tanh(sum*0.72)));
+    }
+    return true;
+  }
+}
+registerProcessor('harp-strings', HarpStrings);
+
+// ============================================================
+// 바람 충돌 워클릿 — 하나의 실제 바람 녹음을 3대역으로 분리한다.
+// 손의 면적·상대풍속·손가락 틈은 새 소리를 만들지 않고 대역 비율만 바꾼다.
+// ============================================================
+class WindFlow extends AudioWorkletProcessor {
+  static get parameterDescriptors(){
+    return [
+      {name:'contact', defaultValue:0, minValue:0, maxValue:7, automationRate:'k-rate'},
+      {name:'body', defaultValue:0.5, minValue:0, maxValue:1, automationRate:'k-rate'},
+      {name:'turbulence', defaultValue:0.4, minValue:0, maxValue:2, automationRate:'k-rate'},
+      {name:'hiss', defaultValue:0.3, minValue:0, maxValue:2.5, automationRate:'k-rate'},
+    ];
+  }
+  constructor(){
+    super();
+    this.dc=0; this.bodyLP=0; this.midLP=0;
+    this.aDC=1-Math.exp(-2*Math.PI*38/sampleRate);
+    this.aBody=1-Math.exp(-2*Math.PI*680/sampleRate);
+    this.aMid=1-Math.exp(-2*Math.PI*3400/sampleRate);
+  }
+  process(inputs, outputs, parameters){
+    const input=inputs[0], out=outputs[0][0];
+    if(!out) return true;
+    const L=input?.[0], R=input?.[1];
+    const contact=parameters.contact[0]||0;
+    const body=parameters.body[0]||0;
+    const turbulence=parameters.turbulence[0]||0;
+    const hiss=parameters.hiss[0]||0;
+    for(let i=0;i<out.length;i++){
+      let x=(L?L[i]:0)+(R?R[i]:0);
+      // 스테레오 평균(-6dB)이 아니라 등전력 모노 합산(-3dB)을 사용해
+      // 국소 바람의 밀도를 보존한다. 전역 배경 루프의 크기에는 영향이 없다.
+      if(L&&R) x*=0.70710678;
+      this.dc += this.aDC*(x-this.dc);
+      x-=this.dc;
+      this.bodyLP += this.aBody*(x-this.bodyLP);
+      this.midLP += this.aMid*(x-this.midLP);
+      const low=this.bodyLP;
+      const mid=this.midLP-this.bodyLP;
+      const high=x-this.midLP;
+      // 손바닥 정면에서는 원본의 대역 균형을 거의 그대로 통과시킨다.
+      // 저역을 추가로 증폭하지 않고, 손날이 될수록 저역을 덜어내며 고역 난류만 올린다.
+      const y=low*(0.55+body*0.45)
+        + mid*(0.92+turbulence*0.22)
+        + high*(0.96+hiss*0.50);
+      out[i]=y*contact;
+    }
+    return true;
+  }
+}
+registerProcessor('wind-flow', WindFlow);
+`;
+
+// ============================================================
+// 오디오 — 좌/우 손 각각 워클릿 + 스테레오 패닝
+// ============================================================
+let ctx=null, hand={};  // hand.Left / hand.Right = {node, panner}
+let audioReady=false;
+let master=null, masterLimiter=null, roomNode=null, lateNode=null, earlyGain=null, lateGain=null;
+// === 확장 엔진 전역 상태 ===
+//  spatialListener: 머리 중심 원점 좌표계(§1). 매 프레임 재사용해 GC 없음(§11).
+let spatialListener=null;
+let currentRoom=null, currentAbsorb=0.10, currentRT60=1.0;
+const _localPos={x:0,y:0,z:0}, _srcLocal={x:0,y:0,z:0};   // 프레임마다 재사용(§11)
+const _hrtfWorld={x:0,y:0,z:0}, _hrtfLocal={x:0,y:0,z:0};
+const _listenerHand={x:0,y:0,z:0,distM:0,dist01:0,valid:false};
+const _fwd={x:0,y:0,z:0}, _up={x:0,y:0,z:0};
+const HRTF_FADE_IN=Float32Array.from({length:17},(_,i)=>Math.sin(i/16*Math.PI*0.5));
+const HRTF_FADE_OUT=Float32Array.from({length:17},(_,i)=>Math.cos(i/16*Math.PI*0.5));
+let timbre='water-drops';    // 물 | 나무껍질 | 하프 | 바람
+let measuredHrtfBuffers=[];
+
+const WIND_SAMPLE_URL='../sound_assets/wind/wind_eye_loop_48k.wav';
+let windBuf=null, windLoadPromise=null;
+let windBedSource=null, windBedGain=null, windBedHP=null, windBedLP=null, windBedShelf=null;
+const FOREST_SAMPLE_URL='../sound_assets/forest/forest_connecticut_loop_48k.wav';
+let forestBuf=null, forestLoadPromise=null;
+let forestSource=null, forestGain=null, forestHP=null, forestLP=null;
+const PENCIL_SAMPLE_URL='../sound_assets/pencil/pencil_paper_texture_48k.wav';
+let pencilBuf=null, pencilLoadPromise=null;
+let deskInput=null, deskHP=null, deskSum=null, deskComp=null, deskPanner=null;
+let deskModes=[];
+
+// Etherealwinds Harp II CE: 음높이마다 하나의 고정 WAV(v3/RR1)만 사용한다.
+// 손 속도는 추가 샘플 선택이 아니라 ADSR·EQ·미세 피치·압축을 함께 구동하는 excitation이다.
+const HARP_SAMPLE_DIR='../sound_assets/harp/';
+const HARP_SAMPLE_MIN=42, HARP_SAMPLE_MAX=79;
+const HARP_PITCH_NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const HARP_FIXED_SAMPLE_NOTES=Array.from({length:HARP_SAMPLE_MAX-HARP_SAMPLE_MIN+1},(_,i)=>HARP_SAMPLE_MIN+i);
+const harpSampleBuffers=new Map(), harpSampleRequests=new Map();
+function harpSampleSpec(note){
+  // G5보다 높은 화면 음은 가장 가까운 G5 녹음을 피치 업한다.
+  const root=Math.max(HARP_SAMPLE_MIN,Math.min(HARP_SAMPLE_MAX,note));
+  const pitch=HARP_PITCH_NAMES[root%12], octave=Math.floor(root/12)-1;
+  // 손가락 속도는 이 함수에서 음색을 바꾸지 않고, 아래 gain에서 볼륨에만 반영된다.
+  const layer='v3', rr=1;
+  const file=`EWHarp_Normal_${pitch}${octave}_${layer}_RR${rr}.wav`;
+  return {file,note:root,key:file};
+}
+function requestHarpSample(spec){
+  if(harpSampleBuffers.has(spec.key)) return Promise.resolve(harpSampleBuffers.get(spec.key));
+  if(harpSampleRequests.has(spec.key)) return harpSampleRequests.get(spec.key);
+  const request=fetch(HARP_SAMPLE_DIR+encodeURIComponent(spec.file))
+    .then(res=>{ if(!res.ok) throw new Error(`${spec.file}: HTTP ${res.status}`); return res.arrayBuffer(); })
+    .then(data=>ctx.decodeAudioData(data))
+    .then(buffer=>{ harpSampleBuffers.set(spec.key,buffer); return buffer; })
+    .catch(err=>{ console.warn('[harp] sample load failed:',err); return null; })
+    .finally(()=>harpSampleRequests.delete(spec.key));
+  harpSampleRequests.set(spec.key,request);
+  return request;
+}
+function preloadHarpSamples(){
+  return Promise.all(HARP_FIXED_SAMPLE_NOTES.map(note=>requestHarpSample(harpSampleSpec(note))))
+    .then(()=>console.info(`[harp] ${harpSampleBuffers.size} fixed v3 samples ready`));
+}
+const harpFixedVoices=[];
+const HARP_MAX_ACTIVE_VOICES=12;
+function playHarpSample(which, note, excitation, delay, pose){
+  if(!ctx) return false;
+  const spec=harpSampleSpec(note), buffer=harpSampleBuffers.get(spec.key);
+  // 첫 재생 전에도 물리현을 섞지 않는다. WAV 준비가 끝난 직후 같은 플럭을 재생한다.
+  if(!buffer){
+    requestHarpSample(spec).then(loaded=>{ if(loaded) playHarpSample(which,note,excitation,0,pose); });
+    return true;
+  }
+  const sample={...spec,buffer};
+  const when=ctx.currentTime+Math.max(0,delay||0);
+  const e=Math.max(0,Math.min(1,excitation));
+  const loudnessGain=Math.pow(e,1.4);                 // 지각상 자연스러운 강도 곡선
+  const attack=0.018-(0.016*e);                       // weak 18ms → strong 2ms
+  const decay=0.090-(0.050*e);
+  const sustain=Math.max(0.001,loudnessGain*(0.94-0.16*e));
+  const brightness=Math.pow(e,0.62);
+
+  // 플럭 순간의 위치를 갖는 독립 HRTF 보이스. 손을 옮겨도 이 노드는 갱신하지 않는다.
+  // sample → ADSR → excitation LPF → brightness → transient/noise → spectral tilt
+  //        → compressor → 기존 거리/HRTF/room 경로
+  const amp=ctx.createGain(), excitationLP=ctx.createBiquadFilter();
+  const brightShelf=ctx.createBiquadFilter(), transientShelf=ctx.createBiquadFilter(), tiltShelf=ctx.createBiquadFilter();
+  const hp=ctx.createBiquadFilter(), comp=ctx.createDynamicsCompressor();
+  const spatialLP=ctx.createBiquadFilter(), panner=new PannerNode(ctx,{panningModel:'HRTF',distanceModel:'inverse',refDistance:0.25,maxDistance:3,rolloffFactor:0.9});
+  hp.type='highpass'; hp.frequency.value=45; hp.Q.value=0.7;
+  // 강할수록 넓은 대역/고역 셸프. v3 원본 하나를 약한 플럭에도 자연스럽게 만든다.
+  excitationLP.type='lowpass'; excitationLP.Q.value=0.55;
+  excitationLP.frequency.setValueAtTime(2500+15500*brightness,when); // 2.5kHz → 18kHz
+  brightShelf.type='highshelf'; brightShelf.frequency.value=3000; brightShelf.Q.value=0.65;
+  brightShelf.gain.setValueAtTime(6*e,when);                         // 0 → +6dB
+  // 샘플의 첫 고역 성분만 들어 올려 손가락이 현을 놓는 미세한 노이즈를 만든다.
+  transientShelf.type='highshelf'; transientShelf.frequency.value=8200; transientShelf.Q.value=0.7;
+  transientShelf.gain.setValueAtTime(2+9*e,when);
+  transientShelf.gain.linearRampToValueAtTime(0,when+(0.030-0.018*e));
+  // 약한 플럭일수록 고주파가 더 빨리 사라지는 spectral tilt envelope.
+  tiltShelf.type='highshelf'; tiltShelf.frequency.value=4100; tiltShelf.Q.value=0.55;
+  tiltShelf.gain.setValueAtTime(0,when);
+  tiltShelf.gain.linearRampToValueAtTime(-12+8*e,when+(0.070+0.210*e));
+  // 강한 연주에서만 peak를 살짝 제어한다. 레이어 합성이나 하드 리미팅은 하지 않는다.
+  comp.threshold.value=-7-10*e; comp.knee.value=12;
+  comp.ratio.value=1.05+1.55*e; comp.attack.value=0.003+0.006*(1-e); comp.release.value=0.10+0.10*(1-e);
+  const d=Math.max(0,Math.min(1,pose?.dist01??0.4)), near=1-d;
+  spatialLP.type='lowpass'; spatialLP.frequency.value=2200+(16000-2200)*Math.pow(near,0.8); spatialLP.Q.value=0.7;
+  const px=Math.max(-0.85,Math.min(0.85,(pose?.panPos??0)*(0.7+near*1.1)));
+  if(panner.positionX){ panner.positionX.value=px; panner.positionY.value=-0.05; panner.positionZ.value=-0.2-d*1.1; }
+  excitationLP.connect(brightShelf).connect(transientShelf).connect(tiltShelf).connect(hp).connect(comp);
+  comp.connect(spatialLP).connect(panner).connect(master);
+  const earlyDelay=ctx.createDelay(0.08), early=ctx.createGain(), late=ctx.createGain();
+  earlyDelay.delayTime.value=0.014-0.010*d;
+  early.gain.value=(0.03+0.80*Math.pow(d,1.4))*(+revAmtEl.value)*1.35;
+  late.gain.value=(0.06+0.60*Math.pow(d,1.1))*(+revAmtEl.value)*1.85;
+  comp.connect(earlyDelay).connect(early).connect(roomNode); comp.connect(late).connect(lateNode);
+  const src=ctx.createBufferSource(), sources=[src];
+  src.buffer=sample.buffer;
+  const baseRate=Math.pow(2,(note-sample.note)/12), pitchLift=3+2*e;
+  src.playbackRate.setValueAtTime(baseRate*Math.pow(2,pitchLift/1200),when);
+  src.playbackRate.linearRampToValueAtTime(baseRate,when+0.020);     // attack 때 +3~5 cents, 20ms 뒤 복귀
+  amp.gain.setValueAtTime(0,when);
+  amp.gain.linearRampToValueAtTime(Math.max(0.001,loudnessGain),when+attack);
+  amp.gain.setTargetAtTime(sustain,when+attack,decay);               // ADSR의 decay/sustain 구간
+  src.connect(amp).connect(excitationLP); src.start(when);
+  const maxDur=src.buffer.duration/baseRate;
+  const voice={done:false};
+  const dispose=()=>{ if(voice.done)return; voice.done=true; for(const source of sources)try{source.disconnect();}catch(e){}; for(const n of [amp,excitationLP,brightShelf,transientShelf,tiltShelf,hp,comp,spatialLP,panner,earlyDelay,early,late])try{n.disconnect();}catch(e){}; const i=harpFixedVoices.indexOf(voice); if(i>=0)harpFixedVoices.splice(i,1); };
+  // 보이스 상한을 넘을 때 파형 한가운데서 disconnect하면 클릭 노이즈가 난다.
+  // 약 220ms 동안 0으로 릴리스한 뒤에만 source/node를 정리한다.
+  const release=()=>{
+    if(voice.done || voice.releasing) return;
+    voice.releasing=true;
+    const releaseAt=ctx.currentTime;
+    amp.gain.cancelScheduledValues(releaseAt);
+    amp.gain.setTargetAtTime(0,releaseAt,0.032);
+    try{ src.stop(releaseAt+0.22); }catch(e){}
+    setTimeout(dispose,250);
+  };
+  voice.dispose=dispose; voice.release=release; harpFixedVoices.push(voice);
+  // 이미 release 중인 첫 보이스를 다시 고르는 대신, 살아 있는 가장 오래된 보이스를
+  // 하나씩 릴리스한다. 빠른 스윕에서도 보이스 수가 누적되어 오디오가 멈추지 않는다.
+  let activeVoices=0;
+  for(const v of harpFixedVoices) if(!v.releasing && !v.done) activeVoices++;
+  while(activeVoices>HARP_MAX_ACTIVE_VOICES){
+    let oldest=null;
+    for(const v of harpFixedVoices){ if(!v.releasing && !v.done){ oldest=v; break; } }
+    if(!oldest) break;
+    oldest.release();
+    activeVoices--;
+  }
+  src.onended=dispose;
+  setTimeout(dispose,Math.ceil((delay+maxDur+0.15)*1000));
+  return true;
+}
+
+// CIPIC subject 003에서 손 동선에 필요한 9방위×3고도만 추린 측정 HRIR.
+// 원본 1.8MB SOFA를 런타임 파싱하지 않고 21KB int16 데이터만 AudioBuffer로 복원한다.
+function buildMeasuredHrtfBuffers(){
+  const data=window.CIPIC_HRIR_DATA;
+  if(!ctx || !data?.base64) return [];
+  const bytes=Uint8Array.from(atob(data.base64), c=>c.charCodeAt(0));
+  const view=new DataView(bytes.buffer);
+  const valuesPerFilter=2*data.taps;
+  const filterCount=data.azimuths.length*data.elevations.length;
+  const sampleScale=data.peak/32767*0.70;
+  const outputTaps=Math.ceil(data.taps*ctx.sampleRate/data.sampleRate);
+  const buffers=new Array(filterCount);
+  for(let filterIndex=0; filterIndex<filterCount; filterIndex++){
+    const buffer=ctx.createBuffer(2, outputTaps, ctx.sampleRate);
+    const base=filterIndex*valuesPerFilter;
+    for(let ear=0; ear<2; ear++){
+      const channel=buffer.getChannelData(ear);
+      const earBase=base+ear*data.taps;
+      for(let tap=0; tap<outputTaps; tap++){
+        const sourcePosition=tap*data.sampleRate/ctx.sampleRate;
+        const index0=Math.min(data.taps-1, Math.floor(sourcePosition));
+        const index1=Math.min(data.taps-1, index0+1);
+        const mix=sourcePosition-index0;
+        const sample0=view.getInt16((earBase+index0)*2, true);
+        const sample1=view.getInt16((earBase+index1)*2, true);
+        channel[tap]=(sample0+(sample1-sample0)*mix)*sampleScale;
+      }
+    }
+    buffers[filterIndex]=buffer;
+  }
+  return buffers;
+}
+
+function nearestMeasuredHrtf(azimuth, elevation){
+  const data=window.CIPIC_HRIR_DATA;
+  if(!data) return 0;
+  let best=0, bestDistance=Infinity;
+  for(let elevationIndex=0; elevationIndex<data.elevations.length; elevationIndex++){
+    for(let azimuthIndex=0; azimuthIndex<data.azimuths.length; azimuthIndex++){
+      const da=(azimuth-data.azimuths[azimuthIndex])/20;
+      const de=(elevation-data.elevations[elevationIndex])/28.125;
+      const distance=da*da+de*de;
+      if(distance<bestDistance){
+        bestDistance=distance;
+        best=elevationIndex*data.azimuths.length+azimuthIndex;
+      }
+    }
+  }
+  return best;
+}
+
+// 비활성 Convolver에 새 HRIR을 넣고 90ms 동안 등가전력으로 전환한다.
+// 전환이 끝나면 이전 Convolver 입력을 끊어 안정 상태에서는 손마다 하나만 처리한다.
+function updateMeasuredHrtf(voice, azimuth, elevation){
+  if(!voice?.hrtfState || measuredHrtfBuffers.length===0) return;
+  const state=voice.hrtfState;
+  const nextIndex=nearestMeasuredHrtf(azimuth, elevation);
+  if(nextIndex===state.index || state.pending>=0) return;
+  const fromIndex=state.active;
+  const toIndex=1-fromIndex;
+  const from=fromIndex===0?voice.hrtfConvA:voice.hrtfConvB;
+  const to=toIndex===0?voice.hrtfConvA:voice.hrtfConvB;
+  const fromGain=fromIndex===0?voice.hrtfGainA:voice.hrtfGainB;
+  const toGain=toIndex===0?voice.hrtfGainA:voice.hrtfGainB;
+  const now=ctx.currentTime;
+  state.pending=nextIndex;
+  to.buffer=measuredHrtfBuffers[nextIndex];
+  voice.palmShelf.connect(to);
+  fromGain.gain.cancelScheduledValues(now);
+  toGain.gain.cancelScheduledValues(now);
+  fromGain.gain.setValueAtTime(1, now);
+  toGain.gain.setValueAtTime(0, now);
+  fromGain.gain.setValueCurveAtTime(HRTF_FADE_OUT, now, 0.09);
+  toGain.gain.setValueCurveAtTime(HRTF_FADE_IN, now, 0.09);
+  state.timer=setTimeout(()=>{
+    try{ voice.palmShelf.disconnect(from); }catch(e){}
+    state.active=toIndex;
+    state.index=nextIndex;
+    state.pending=-1;
+    state.timer=null;
+  }, 120);
+}
+
+// 음색 버튼: 세 음색을 독립 버튼으로 두고, 선택한 음색만 새 보이스로 교체한다.
+function setTimbre(next){
+  if(next===timbre){
+    applySceneSpatialPreset(next);
+    // 같은 연필 버튼을 다시 누르면 샘플 보이스까지 재구성해 무음 상태를 복구한다.
+    if(next==='bark-friction'&&audioReady){
+      rebuildTimbre();
+      ensurePencilSceneAudio();
+    }
+    return;
+  }
+  timbre=next;
+  applySceneSpatialPreset(next);
+  syncParamGroups();
+  // 먼저 새 음색 보이스를 만든 뒤 배경과 샘플을 활성화한다. 이전 보이스 정리와
+  // 비동기 샘플 완료가 엇갈려 새 연필 노드가 샘플 없이 남는 경우를 막는다.
+  rebuildTimbre();
+  updateOceanForTimbre();
+  updateWindForTimbre();
+  updateForestForTimbre();
+  if(next==='wind-flow') loadWindSample();
+  if(next==='bark-friction') ensurePencilSceneAudio();
+}
+document.querySelectorAll('.timbreChoice').forEach(btn=>{
+  btn.addEventListener('click',()=>setTimbre(btn.dataset.timbre));
+});
+// 현재 음색에 해당하는 파라미터 그룹만 보이게
+function syncParamGroups(){
+  const water = (timbre==='water-drops');
+  const bark = (timbre==='bark-friction');
+  grpWater.hidden = !water;
+  grpBark.hidden  = !bark;
+  grpHarp.hidden  = timbre!=='harp-strings';
+  grpWind.hidden  = timbre!=='wind-flow';
+  document.querySelectorAll('.timbreChoice').forEach(btn=>{
+    const on=btn.dataset.timbre===timbre;
+    btn.style.background=on?'#18181b':'#fff';
+    btn.style.color=on?'#fff':'#18181b';
+  });
+}
+// 첫 장면(물)도 HTML 공통값이 아니라 수중 프리셋으로 시작한다.
+// WALL_ABSORB 등 룸 상수 선언이 이 아래에 있으므로, 현재 스크립트 평가가 끝난 뒤 적용한다.
+queueMicrotask(()=>applySceneSpatialPreset(timbre));
+syncParamGroups();
+// 배경 바닷소리는 물 음색일 때만 재생 (나무껍질이면 무음).
+function setSceneBedGain(param,target,active){
+  if(!param||!ctx) return;
+  const now=ctx.currentTime;
+  // 전환 도중 다시 장면을 바꿔도 현재 음량에서 이어지게 유지한다.
+  if(typeof param.cancelAndHoldAtTime==='function') param.cancelAndHoldAtTime(now);
+  else {
+    const current=param.value;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(current,now);
+  }
+  if(active) param.linearRampToValueAtTime(target,now+2.0);
+  else param.setTargetAtTime(0,now,0.08);
+}
+function updateOceanForTimbre(){
+  if(!oceanGain||!ctx) return;
+  const active=timbre==='water-drops';
+  setSceneBedGain(oceanGain.gain,active ? +bedVolEl.value : 0,active);
+}
+// 바람은 손이 없어도 하나의 전역 배경만 낮게 유지한다.
+// 손별 보이스를 배경으로 재사용하면 같은 녹음이 세 번 겹쳐 위상과 볼륨이 불안정해진다.
+function updateWindForTimbre(){
+  if(!windBedGain||!ctx) return;
+  const active=timbre==='wind-flow';
+  setSceneBedGain(windBedGain.gain,active ? +windBedEl.value : 0,active);
+}
+// 숲 녹음은 연필 씬에서 선택적으로 유지되는 비공간화된 환경 바닥이다.
+// 손에서 나는 종이 마찰음의 위치·거리·HRTF에는 섞지 않는다.
+function updateForestForTimbre(){
+  if(!forestGain||!ctx) return;
+  const active=timbre==='bark-friction';
+  setSceneBedGain(forestGain.gain,active ? +forestBedEl.value : 0,active);
+}
+function ensurePencilSceneAudio(){
+  if(!ctx||timbre!=='bark-friction') return;
+  // 이미 디코딩된 경우 즉시 재연결한다.
+  if(forestBuf) startForestBed();
+  if(pencilBuf){
+    for(const side of ['Left','Right']) attachPencilSample(hand[side]);
+    updatePencilRegion();
+  }
+  updateForestForTimbre();
+  // 아직 로딩 중이거나 처음 로드하는 경우에도, 완료 시점의 현재 보이스에 다시 붙인다.
+  loadForestSample().then(()=>{
+    if(timbre!=='bark-friction') return;
+    startForestBed();
+    updateForestForTimbre();
+  });
+  loadPencilSample().then(()=>{
+    if(timbre!=='bark-friction') return;
+    for(const side of ['Left','Right']) attachPencilSample(hand[side]);
+    updatePencilRegion();
+  });
+}
+async function loadForestSample(){
+  if(forestBuf) return forestBuf;
+  if(forestLoadPromise) return forestLoadPromise;
+  forestLoadPromise=fetch(FOREST_SAMPLE_URL)
+    .then(res=>{ if(!res.ok) throw new Error(`forest sample: HTTP ${res.status}`); return res.arrayBuffer(); })
+    .then(data=>ctx.decodeAudioData(data))
+    .then(buffer=>{
+      forestBuf=buffer;
+      startForestBed();
+      console.info(`[forest] ${buffer.duration.toFixed(1)}s loop ready`);
+      return buffer;
+    })
+    .catch(err=>{ console.warn('[forest] sample load failed:',err); return null; })
+    .finally(()=>{ forestLoadPromise=null; });
+  return forestLoadPromise;
+}
+function startForestBed(){
+  if(!ctx||!forestBuf||forestSource) return;
+  forestSource=ctx.createBufferSource();
+  forestSource.buffer=forestBuf;
+  forestSource.loop=true;
+  forestSource.loopStart=0;
+  forestSource.loopEnd=forestBuf.duration;
+  forestHP=ctx.createBiquadFilter();
+  forestHP.type='highpass'; forestHP.frequency.value=75; forestHP.Q.value=0.5;
+  forestLP=ctx.createBiquadFilter();
+  forestLP.type='lowpass'; forestLP.frequency.value=14500; forestLP.Q.value=0.45;
+  forestGain=ctx.createGain(); forestGain.gain.value=0;
+  forestSource.connect(forestHP).connect(forestLP).connect(forestGain).connect(master);
+  forestSource.start(ctx.currentTime+0.03,0);
+  updateForestForTimbre();
+}
+async function loadPencilSample(){
+  if(pencilBuf) return pencilBuf;
+  if(pencilLoadPromise) return pencilLoadPromise;
+  pencilLoadPromise=fetch(PENCIL_SAMPLE_URL)
+    .then(res=>{ if(!res.ok) throw new Error(`pencil sample: HTTP ${res.status}`); return res.arrayBuffer(); })
+    .then(data=>ctx.decodeAudioData(data))
+    .then(buffer=>{
+      pencilBuf=buffer;
+      for(const side of ['Left','Right']) attachPencilSample(hand[side]);
+      console.info(`[pencil] ${buffer.duration.toFixed(1)}s texture ready`);
+      return buffer;
+    })
+    .catch(err=>{ console.warn('[pencil] sample load failed:',err); return null; })
+    .finally(()=>{ pencilLoadPromise=null; });
+  return pencilLoadPromise;
+}
+function attachPencilSample(voice){
+  if(!pencilBuf||!voice||voice.pencilReady||timbre!=='bark-friction') return;
+  const source=pencilBuf.getChannelData(0);
+  const copy=new Float32Array(source.length);
+  copy.set(source);
+  voice.node.port.postMessage({type:'sample',samples:copy},[copy.buffer]);
+  voice.node.port.postMessage({type:'region',index:+pencilRegionEl.value});
+  voice.pencilReady=true;
+}
+function updatePencilRegion(){
+  if(timbre!=='bark-friction') return;
+  const index=+pencilRegionEl.value;
+  for(const side of ['Left','Right']){
+    const voice=hand[side];
+    if(voice) voice.node.port.postMessage({type:'region',index});
+  }
+}
+function createDeskResonator(){
+  if(!ctx||!master||deskInput) return;
+  deskInput=ctx.createGain();
+  deskHP=ctx.createBiquadFilter();
+  deskHP.type='highpass'; deskHP.frequency.value=32; deskHP.Q.value=0.55;
+  deskSum=ctx.createGain(); deskSum.gain.value=1.70;
+  // 책상 상판의 비정수 모드. 저역 두 모드를 아래로 내리고 Q를 높여
+  // 연필 마찰 뒤에 깊은 몸통이 조금 더 오래 남게 한다.
+  const specs=[[54,34,1.08],[86,30,0.88],[139,22,0.62],[226,16,0.38],[370,10,0.20]];
+  deskInput.connect(deskHP);
+  deskModes=specs.map(([frequency,q,gain])=>{
+    const filter=ctx.createBiquadFilter();
+    filter.type='bandpass'; filter.frequency.value=frequency; filter.Q.value=q;
+    const level=ctx.createGain(); level.gain.value=gain;
+    deskHP.connect(filter).connect(level).connect(deskSum);
+    return {filter,level};
+  });
+  deskComp=ctx.createDynamicsCompressor();
+  deskComp.threshold.value=-18; deskComp.knee.value=12; deskComp.ratio.value=2.2;
+  deskComp.attack.value=0.006; deskComp.release.value=0.20;
+  // 책상은 손을 따라다니지 않고 사용자 정면 아래쪽의 고정된 물체로 들린다.
+  deskPanner=new PannerNode(ctx,{
+    panningModel:'HRTF',distanceModel:'inverse',
+    refDistance:0.38,maxDistance:3,rolloffFactor:0.55,
+    positionX:0,positionY:-0.32,positionZ:-0.62,
+  });
+  deskSum.connect(deskComp).connect(deskPanner).connect(master);
+}
+async function loadWindSample(){
+  if(windBuf) return windBuf;
+  if(windLoadPromise) return windLoadPromise;
+  windLoadPromise=fetch(WIND_SAMPLE_URL)
+    .then(res=>{ if(!res.ok) throw new Error(`wind sample: HTTP ${res.status}`); return res.arrayBuffer(); })
+    .then(data=>ctx.decodeAudioData(data))
+    .then(buffer=>{
+      windBuf=buffer;
+      startWindBed();
+      for(const side of ['Left','Right']) attachWindSource(hand[side],side);
+      console.info(`[wind] ${buffer.duration.toFixed(1)}s loop ready`);
+      return buffer;
+    })
+    .catch(err=>{ console.warn('[wind] sample load failed:',err); return null; })
+    .finally(()=>{ windLoadPromise=null; });
+  return windLoadPromise;
+}
+function startWindBed(){
+  if(!ctx||!windBuf||windBedSource) return;
+  windBedSource=ctx.createBufferSource();
+  windBedSource.buffer=windBuf;
+  windBedSource.loop=true;
+  windBedSource.loopStart=0;
+  windBedSource.loopEnd=windBuf.duration;
+  windBedHP=ctx.createBiquadFilter();
+  windBedHP.type='highpass'; windBedHP.frequency.value=42; windBedHP.Q.value=0.5;
+  windBedLP=ctx.createBiquadFilter();
+  windBedLP.type='lowpass'; windBedLP.frequency.value=9800; windBedLP.Q.value=0.45;
+  // 공간 전체의 바람에만 낮고 넓은 바닥을 만든다. 손의 국소음에는 적용하지 않는다.
+  windBedShelf=ctx.createBiquadFilter();
+  windBedShelf.type='lowshelf'; windBedShelf.frequency.value=190; windBedShelf.gain.value=4;
+  windBedGain=ctx.createGain(); windBedGain.gain.value=0;
+  windBedSource.connect(windBedHP).connect(windBedLP).connect(windBedShelf).connect(windBedGain).connect(master);
+  windBedSource.start(ctx.currentTime+0.03, 0);
+  updateWindForTimbre();
+}
+function attachWindSource(voice, side){
+  if(!ctx||!windBuf||!voice||voice.windSource||timbre!=='wind-flow') return;
+  const src=ctx.createBufferSource();
+  src.buffer=windBuf; src.loop=true; src.loopStart=0; src.loopEnd=windBuf.duration;
+  // 같은 느린 풍속 변화는 공유하되 두 손의 미세 난류 파형은 겹치지 않게 위상을 벌린다.
+  const offset=(side==='Left'?17.3:43.7)%Math.max(1,windBuf.duration);
+  src.connect(voice.node);
+  src.start(ctx.currentTime+0.02,offset);
+  voice.windSource=src;
+}
+async function initAudio(){
+  if(ctx) return;
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  const blob=new Blob([WORKLET],{type:'application/javascript'});
+  const url=URL.createObjectURL(blob); await ctx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+  measuredHrtfBuffers=buildMeasuredHrtfBuffers();
+  master=ctx.createGain(); master.gain.value=1.0;
+  // 두 손의 글리산도와 잔향이 합쳐질 때만 피크를 부드럽게 누르는 최종 안전 리미터.
+  masterLimiter=ctx.createDynamicsCompressor();
+  masterLimiter.threshold.value=-3; masterLimiter.knee.value=5;
+  masterLimiter.ratio.value=12; masterLimiter.attack.value=0.002; masterLimiter.release.value=0.14;
+  master.connect(masterLimiter).connect(ctx.destination);
+  // HRTF 리스너: 정면(-z)을 바라봄.
+  if(ctx.listener.forwardZ){ ctx.listener.forwardX.value=0; ctx.listener.forwardY.value=0; ctx.listener.forwardZ.value=-1;
+    ctx.listener.upX.value=0; ctx.listener.upY.value=1; ctx.listener.upZ.value=0; }
+
+  // === B. 룸 반사/잔향 — 거리 구동 DRR (externalization + 거리감의 핵심) ===
+  //  뇌는 "직접음+반사"로 거리·머리밖 정위를 판단. 반사 없으면 소리가 머릿속으로 붕괴.
+  //
+  //  ★ 예전엔 roomGain이 고정 0.4라, 손이 코앞이든 뻗은 상태든 직접음:잔향 비율(DRR)이
+  //    똑같았다. 볼륨만 줄어드니 "멀어진 소리"가 아니라 "작아진 소리"로 들렸음.
+  //    문헌: DRR은 절대 거리 지각에 유일하게 유효한 단서이고, 초기반사가 거리 추정의
+  //    최대 정보원. 특히 팔 닿는 거리(peripersonal space)에서 강함.
+  //  → 초기반사(early)와 후기잔향(late)을 별도 컨볼버로 분리해 각각 거리로 제어한다.
+  const SR=ctx.sampleRate;
+  // 두 IR을 만든다: roomNode=초기반사(짧고 이산적), lateNode=후기 확산 꼬리
+  roomNode=ctx.createConvolver(); lateNode=ctx.createConvolver();
+  const elen=Math.floor(SR*0.12), llen=Math.floor(SR*0.45);
+  const ebuf=ctx.createBuffer(2,elen,SR), lbuf=ctx.createBuffer(2,llen,SR);
+  const early=[[0.007,0.5],[0.011,0.42],[0.017,0.38],[0.023,0.32],[0.031,0.28],
+               [0.041,0.24],[0.053,0.2],[0.067,0.17],[0.083,0.14],[0.101,0.11]];
+  for(let ch=0; ch<2; ch++){
+    const e=ebuf.getChannelData(ch);
+    for(let i=0;i<elen;i++) e[i]=0;
+    early.forEach(([t,g],k)=>{
+      const jitter=(ch? 0.0004 : -0.0004)*(k%2?1:-1);   // 좌우 디코릴레이션
+      const idx=Math.floor((t+jitter)*SR);
+      if(idx>=0 && idx<elen) e[idx]+= g*(ch?-1:1)*(0.7+0.3*Math.random());
+    });
+    const l=lbuf.getChannelData(ch);
+    for(let i=0;i<llen;i++){
+      const env=Math.pow(1-i/llen, 2.2);
+      l[i]=(Math.random()*2-1)*env*0.18;
+    }
+  }
+  roomNode.buffer=ebuf; lateNode.buffer=lbuf;
+  // §1 리스너 좌표계 + §5/§6 룸 모델 초기화
+  spatialListener=new SpatialListener();
+  applyRoomModel();      // currentRoom / currentAbsorb / RT60 + late IR 재생성
+  // 게인은 setHand가 거리에 따라 실시간으로 움직인다(초기값은 중간).
+  earlyGain=ctx.createGain(); earlyGain.gain.value=0.3;
+  lateGain =ctx.createGain(); lateGain.gain.value=0.25;
+  roomNode.connect(earlyGain).connect(master);
+  lateNode.connect(lateGain).connect(master);
+
+  createDeskResonator();
+  hand.Left = mkVoice('Left');
+  hand.Right= mkVoice('Right');
+  audioReady=true;
+
+  // === 배경: 녹음된 바닷소리(underwater.mp3) 크로스페이드 루프 ===
+  startOceanLoop();
+  // 바람 샘플도 백그라운드에서 미리 읽어, 첫 바람 버튼에서 늦게 등장하지 않게 한다.
+  loadWindSample();
+  // 나무 씬의 조용한 숲 배경도 미리 읽어 첫 전환에서 지연되지 않게 한다.
+  loadForestSample();
+  // 연필 질감도 미리 디코딩해 첫 드로잉 동작부터 granular 엔진에 공급한다.
+  loadPencilSample();
+  // 실제 사용할 v3/RR1 음정만 미리 읽어 합성 폴백에 따른 음색 변화를 없앤다.
+  preloadHarpSamples();
+}
+
+// ============================================================
+// §6 — 후기 잔향 IR을 Sabine RT60에 맞춰 재생성
+// ------------------------------------------------------------
+//  방 크기·재질이 바뀌면 잔향 길이와 밀도가 바뀌어야 "공간의 크기"가 들린다.
+//  RT60 = 60dB 감쇠까지의 시간 → 지수 감쇠 포락선의 시정수로 환산.
+//  ※ 컨볼버 buffer 교체는 오디오 스레드에서 스위치되므로 진행 중 소리에
+//    글리치가 날 수 있다. 슬라이더 조작 시에만 일어나므로 허용 범위.
+// ============================================================
+function rebuildLateIR(){
+  if(!ctx || !lateNode) return;
+  const SR=ctx.sampleRate;
+  const rt=currentRT60;
+  const len=Math.max(1024, Math.floor(SR*Math.min(3.0, rt)));
+  const buf=ctx.createBuffer(2, len, SR);
+  // 지수 감쇠: 60dB 떨어지는 데 rt초 → amp(t)=10^(-3t/rt)
+  for(let ch=0; ch<2; ch++){
+    const d=buf.getChannelData(ch);
+    for(let i=0;i<len;i++){
+      const t=i/SR;
+      const env=Math.pow(10, -3*t/rt);
+      // 초반은 성글고 뒤로 갈수록 조밀(확산) — 실제 잔향의 에코 밀도 증가 모사
+      const dens=Math.min(1, 0.25+t/Math.max(0.05,rt*0.35));
+      d[i]=(Math.random()*2-1)*env*0.2*dens;
+    }
+  }
+  lateNode.buffer=buf;
+}
+
+// 바닷소리 배경 루프: 양끝을 겹쳐 등가전력(equal-power) 크로스페이드 → 이음매 없이 반복.
+let oceanBuf=null, oceanGain=null, oceanLP=null, oceanDuckGain=null, oceanTimer=null;
+async function startOceanLoop(){
+  try{
+    oceanGain=ctx.createGain();
+    oceanGain.gain.value = +bedVolEl.value;   // '배경 볼륨' 슬라이더로 조절
+    // 배경 밝기: 로우패스로 수중 어둡게↔밝게.
+    oceanLP=ctx.createBiquadFilter(); oceanLP.type='lowpass';
+    oceanLP.frequency.value=bedToneToHz(+bedToneEl.value);
+    // 손 상호작용음의 거리 음색이 고정 배경에 묻히지 않게 하는 독립 덕킹 단.
+    // 장면 페이드용 oceanGain과 분리해 두 자동화가 서로 취소되지 않게 한다.
+    oceanDuckGain=ctx.createGain(); oceanDuckGain.gain.value=1;
+    oceanGain.connect(oceanLP).connect(oceanDuckGain).connect(master);
+    const res=await fetch('../sound_assets/underwater.mp3');
+    const arr=await res.arrayBuffer();
+    oceanBuf=await ctx.decodeAudioData(arr);
+    const XF=2.5;                              // 크로스페이드 길이(초)
+    const dur=oceanBuf.duration;
+    const period=dur-XF;                       // 다음 재생을 이만큼 뒤에 시작
+    const scheduleOne=(startAt)=>{
+      const src=ctx.createBufferSource(); src.buffer=oceanBuf;
+      const g=ctx.createGain(); src.connect(g).connect(oceanGain);
+      // 페이드 인(앞끝) — 등가전력 곡선 근사(선형이지만 겹침으로 자연스러움)
+      g.gain.setValueAtTime(0, startAt);
+      g.gain.linearRampToValueAtTime(1, startAt+XF);
+      // 페이드 아웃(뒷끝)
+      g.gain.setValueAtTime(1, startAt+dur-XF);
+      g.gain.linearRampToValueAtTime(0, startAt+dur);
+      src.start(startAt);
+      src.stop(startAt+dur+0.05);
+      // 다음 인스턴스를 크로스페이드 지점에 예약
+      const next=startAt+period;
+      const wait=(next-ctx.currentTime-1.0)*1000;   // 1초 여유 두고 예약
+      oceanTimer=setTimeout(()=>scheduleOne(next), Math.max(20, wait));
+    };
+    scheduleOne(ctx.currentTime+0.1);
+  }catch(e){ console.warn('ocean loop 로드 실패:', e); }
+}
+
+// 현재 음색(timbre)으로 한 손의 오디오 체인을 만든다
+function mkVoice(which){
+  const isPencil=timbre==='bark-friction';
+  const node=new AudioWorkletNode(ctx,timbre,isPencil
+    ? {numberOfOutputs:2,outputChannelCount:[1,1]}
+    : {outputChannelCount:[1]});
+  // 실제 하프 WAV들이 겹칠 때 여기서 먼저 제어한다. 공격은 살리고, 3음 이상
+  // 겹칠 때만 과도한 합산 피크를 줄여 "굉음/깨짐"을 막는다.
+  const harpInput=ctx.createGain();
+  const harpHP=ctx.createBiquadFilter();
+  harpHP.type='highpass'; harpHP.frequency.value=45; harpHP.Q.value=0.7;
+  const harpComp=ctx.createDynamicsCompressor();
+  harpComp.threshold.value=-13; harpComp.knee.value=14; harpComp.ratio.value=7;
+  harpComp.attack.value=0.004; harpComp.release.value=0.18;
+  harpInput.connect(harpHP).connect(harpComp).connect(node);
+  const p=new PannerNode(ctx,{
+    panningModel:'HRTF', distanceModel:'inverse',
+    refDistance:0.25, maxDistance:3, rolloffFactor:0.9,   // 근접 증폭 완만하게(얼굴 앞 폭증 방지)
+    positionX:0, positionY:-0.05, positionZ:-0.3,
+  });
+  const g=ctx.createGain(); g.gain.value=0.9;
+  // 근접 효과(proximity): 가까울수록 저역 부스트 → "코앞" 압박감
+  const shelf=ctx.createBiquadFilter();
+  shelf.type='lowshelf'; shelf.frequency.value=320; shelf.gain.value=0;
+  // 거리 음색: 멀수록 고역 감소(공기흡수+잔향비↑) → 단지 작아지는 게 아니라 둔탁해짐.
+  const lp=ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=18000; lp.Q.value=0.7;
+  // §4 Near-field 하이셸프: 아주 가까우면 고역이 살아 있고(존재감), 멀면 어두워짐.
+  //  볼륨이 아니라 "음색"으로 근접을 표현하는 부분.
+  const nfShelf=ctx.createBiquadFilter();
+  nfShelf.type='highshelf'; nfShelf.frequency.value=3500; nfShelf.gain.value=0;
+  // 손바닥이 얼굴을 향하는 정도에 따라 직접음의 존재감을 바꾼다.
+  // 노드를 추가로 복제하지 않고 공용 필터 하나만 둬서 두 손에도 가볍다.
+  const palmShelf=ctx.createBiquadFilter();
+  palmShelf.type='highshelf'; palmShelf.frequency.value=2600; palmShelf.gain.value=0;
+  lp.connect(nfShelf).connect(palmShelf);
+
+  // === 측정 HRTF 경로: CIPIC HRIR 27방향 ===
+  // 두 Convolver는 방향 셀을 넘을 때만 90ms 겹치고, 안정 상태에선 하나의 입력을 끊는다.
+  const hrtfConvA=ctx.createConvolver(), hrtfConvB=ctx.createConvolver();
+  hrtfConvA.normalize=hrtfConvB.normalize=false;
+  const hrtfGainA=ctx.createGain(), hrtfGainB=ctx.createGain();
+  hrtfGainA.gain.value=1; hrtfGainB.gain.value=0;
+  const hrtfWet=ctx.createGain(); hrtfWet.gain.value=0;
+  const hrtfOccLP=ctx.createBiquadFilter();
+  hrtfOccLP.type='lowpass'; hrtfOccLP.frequency.value=18000; hrtfOccLP.Q.value=0.5;
+  const hrtfOccGain=ctx.createGain(); hrtfOccGain.gain.value=1;
+  const initialHrtf=nearestMeasuredHrtf(0,0);
+  if(measuredHrtfBuffers[initialHrtf]){
+    hrtfConvA.buffer=measuredHrtfBuffers[initialHrtf];
+    palmShelf.connect(hrtfConvA);
+  }
+  hrtfConvA.connect(hrtfGainA).connect(hrtfWet);
+  hrtfConvB.connect(hrtfGainB).connect(hrtfWet);
+  hrtfWet.connect(hrtfOccLP).connect(hrtfOccGain).connect(master);
+
+  // === A. head shadow 단 (PannerNode 앞) ===
+  //  모노 신호를 좌/우 두 경로로 나눠 각각 다른 게인(ILD)·저역통과(머리 차폐)를 건 뒤,
+  //  ChannelMerger로 스테레오를 만든다. 그 스테레오를 PannerNode가 방향 처리.
+  //  ※ PannerNode는 입력을 다운믹스하므로, head shadow 결과를 그대로 유지하려면
+  //    직결 경로(hsDirect)로도 보낸다. hsMix로 두 경로를 섞어 A/B 비교 가능.
+  const hsL=ctx.createGain(), hsR=ctx.createGain();       // 귀별 ILD 게인
+  const hsLpL=ctx.createBiquadFilter(), hsLpR=ctx.createBiquadFilter();  // 귀별 차폐 저역통과
+  hsLpL.type=hsLpR.type='lowpass'; hsLpL.Q.value=hsLpR.Q.value=0.5;
+  hsLpL.frequency.value=hsLpR.frequency.value=18000;
+
+  // === A. ITD (Interaural Time Difference) — 귀별 도달 시간차 ===
+  //  Woodworth 구형 머리 모델: τ = r(θ + sinθ)/c   (r=9.19cm, c=343m/s)
+  //  검증: θ=90°에서 689μs. 문헌값(r=8.75cm → 656μs)과 일치.
+  //  ※ 문헌상 ITD는 "거리에 거의 무관"(not a strong function of range)하고
+  //    각도만의 함수. 거리 의존은 ILD가 담당 → 두 단서의 역할이 깔끔히 분리된다.
+  //  ※ 듀플렉스 이론: ITD는 ~1500Hz 이하 저역에서 지배적. 그 위는 위상 모호(ambiguity).
+  //    최대 ITD 689μs = 1451Hz의 주기 → 이 위 주파수는 어느 쪽이 앞선지 알 수 없음.
+  const itdL=ctx.createDelay(0.002), itdR=ctx.createDelay(0.002);   // 최대 2ms면 충분
+  itdL.delayTime.value=0; itdR.delayTime.value=0;
+  const merger=ctx.createChannelMerger(2);
+  palmShelf.connect(hsL).connect(hsLpL).connect(itdL).connect(merger, 0, 0);   // 왼귀 → 채널0
+  palmShelf.connect(hsR).connect(hsLpR).connect(itdR).connect(merger, 0, 1);   // 오른귀 → 채널1
+
+  // 두 경로: (a) HRTF panner 경유, (b) head shadow 스테레오 직결.
+  //  hsMix=0 → 기존 동작(HRTF만), 1 → head shadow만. 기본은 중간(둘 다).
+  const viaPanner=ctx.createGain(), hsDirect=ctx.createGain();
+  viaPanner.gain.value=1; hsDirect.gain.value=0;
+  node.connect(g,0,0).connect(shelf).connect(lp);
+  if(isPencil&&deskInput) node.connect(deskInput,1,0);
+  // ※ occlusion(occLP→occGain)은 아래에서 만든 뒤 merger 출력에 직렬로 넣는다.
+  //   여기서는 merger까지만 연결하고, 실제 master 연결은 occlusion 뒤에서 한다.
+  p.connect(master);
+
+  // === C. 근접 저역의 스테레오 분리 ===
+  //  문제: shelf(근접 저역 부스트)가 좌우 분기 "앞"에 있어 저역 덩어리가 양 귀에
+  //  동일 위상으로 들어간다 → 머릿속 중앙에 맺힘(in-head). 코앞 압박감이 안 남.
+  //  해결: 저역만 따로 뽑아 좌우에 미세 시간차를 준다.
+  //  ※ 지연을 크게 주면 콤필터가 가청역에 생긴다. 측정:
+  //     0.3ms → 첫 노치 1667Hz(저역 밖, 안전), 320Hz에서 위상차 35°
+  //     1.0ms → 첫 노치 500Hz(저역 한복판!), 위상차 115° → 위상반전 위험
+  //   따라서 0.5ms 이하로 제한한다.
+  const lowSplit=ctx.createBiquadFilter();
+  lowSplit.type='lowpass'; lowSplit.frequency.value=320; lowSplit.Q.value=0.7;
+  const lowGain=ctx.createGain(); lowGain.gain.value=0;    // 근접도에 따라 setHand가 조절
+  const lowDL=ctx.createDelay(0.002), lowDR=ctx.createDelay(0.002);
+  lowDL.delayTime.value=0; lowDR.delayTime.value=0;
+  const lowMerge=ctx.createChannelMerger(2);
+  // 저역 소스는 head shadow "이전"(lp)에서 뽑는다 — 차폐로 저역이 깎이면 안 되므로.
+  palmShelf.connect(lowSplit).connect(lowGain);
+  lowGain.connect(lowDL).connect(lowMerge, 0, 0);
+  lowGain.connect(lowDR).connect(lowMerge, 0, 1);
+  lowMerge.connect(master);
+
+  // === B. 손별 잔향 센드 (거리 구동 DRR) ===
+  //  손마다 거리가 다르므로 잔향 센드도 손별로 따로 둔다. 공용 게인이면 두 손의
+  //  거리감이 서로 섞여버림.
+  //  preDelay: 초기반사 도착 시각. 음원이 가까울수록 직접음이 빨리 오고 반사는 상대적으로
+  //  늦게 도착 → 시간차↑. 멀면 직접음과 반사가 거의 동시 → 시간차↓. 이 지연 변화가
+  //  "초기반사가 거리 추정의 최대 단서"라는 문헌의 실질적 구현부.
+  const preDelay=ctx.createDelay(0.08);
+  preDelay.delayTime.value=0.006;
+  const sendEarly=ctx.createGain(), sendLate=ctx.createGain();
+  sendEarly.gain.value=0.3; sendLate.gain.value=0.25;
+  // 잔향 센드는 head shadow 이후 신호(merger)에서 뽑아 좌우 반사 비대칭도 유지.
+  merger.connect(preDelay);
+  preDelay.connect(sendEarly).connect(roomNode);
+  merger.connect(sendLate).connect(lateNode);   // 후기잔향은 확산이라 지연 불필요
+
+  // === §7 Occlusion — 장애물 차폐 ===
+  //  직접음 경로에 저역통과 + 게인 감소를 건다. 차폐 시 반사는 오히려 늘린다
+  //  (소리가 돌아서 오므로). occlusion=0이면 완전 통과(18kHz, 게인 1).
+  const occLP=ctx.createBiquadFilter();
+  occLP.type='lowpass'; occLP.frequency.value=18000; occLP.Q.value=0.5;
+  const occGain=ctx.createGain(); occGain.gain.value=1;
+  // 직접음 경로: merger → occlusion → (HRTF panner | head shadow 직결)
+  merger.connect(occLP).connect(occGain);
+  occGain.connect(viaPanner).connect(p);
+  occGain.connect(hsDirect).connect(master);
+
+  // === §5 Image Source 기반 초기반사 (상위 3개만 렌더) ===
+  //  기존의 "고정 IR 컨볼버"(roomNode)는 그대로 두고, 그 위에 소스 위치로
+  //  실시간 계산되는 6개 반사를 더한다. 벽마다 지연·게인·흡음이 다르다.
+  //  ※ 각 반사를 좌/우로 다르게 배분해 방향성을 준다(왼벽 반사는 왼귀 우세).
+  const reflNodes=[];
+  const reflSum=ctx.createChannelMerger(2);
+  for(let i=0;i<3;i++){
+    const dly=ctx.createDelay(0.12);      // 최대 120ms (약 41m 경로)
+    dly.delayTime.value=0.01+i*0.004;
+    const g=ctx.createGain(); g.gain.value=0;
+    // 벽 흡음은 고역을 더 많이 먹는다 → 반사마다 저역통과
+    const f=ctx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=6000; f.Q.value=0.4;
+    const gl=ctx.createGain(), gr=ctx.createGain();   // 좌우 배분
+    gl.gain.value=0.5; gr.gain.value=0.5;
+    palmShelf.connect(dly).connect(g).connect(f);
+    f.connect(gl).connect(reflSum, 0, 0);
+    f.connect(gr).connect(reflSum, 0, 1);
+    reflNodes.push({dly,g,f,gl,gr});
+  }
+  const reflBus=ctx.createGain(); reflBus.gain.value=1;
+  reflSum.connect(reflBus).connect(master);
+
+  const voice={node,harpInput,harpHP,harpComp,panner:p,gain:g,shelf,lp, hsL,hsR,hsLpL,hsLpR,viaPanner,hsDirect,
+          preDelay,sendEarly,sendLate,
+          itdL,itdR, lowSplit,lowGain,lowDL,lowDR,
+          occLP,occGain, reflNodes,reflBus, nfShelf,palmShelf,
+          hrtfConvA,hrtfConvB,hrtfGainA,hrtfGainB,hrtfWet,hrtfOccLP,hrtfOccGain,
+          hrtfState:{active:0,index:initialHrtf,pending:-1,timer:null},
+          // §9 위치 보간용 상태 (할당 없이 재사용)
+          smPos:new Vec3(0,0,-0.3), tgtPos:new Vec3(0,0,-0.3), vel:new Vec3(),
+          reflBuf:[], reflActive:[],
+          windState:{area:0,motion:0,relativeFlow:0.45,spread:0,cup:0,contact:0},
+          jitterPh:Math.random()*6.28};
+  attachWindSource(voice,which);
+  attachPencilSample(voice);
+  return voice;
+}
+
+// 음색 전환: 기존 노드 정리 후 새 프로세서로 재구성
+function rebuildTimbre(){
+  if(!audioReady) return;
+  for(const w of ['Left','Right']){
+    const h=hand[w];
+    if(h){ if(h.hrtfState?.timer) clearTimeout(h.hrtfState.timer);
+           if(h.windSource){ try{ h.windSource.stop(ctx.currentTime+0.03); }catch(e){} }
+           try{ for(const k of ['node','harpInput','harpHP','harpComp','panner','gain','shelf','lp','hsL','hsR','hsLpL','hsLpR',
+                                'viaPanner','hsDirect','preDelay','sendEarly','sendLate',
+                                'itdL','itdR','lowSplit','lowGain','lowDL','lowDR',
+                                'occLP','occGain','reflBus','nfShelf','palmShelf',
+                                'hrtfConvA','hrtfConvB','hrtfGainA','hrtfGainB','hrtfWet','hrtfOccLP','hrtfOccGain'])
+                  if(h[k]) h[k].disconnect(); }catch(e){}
+           // §5 반사 노드들도 정리(누수 방지)
+           try{ if(h.reflNodes) for(const N of h.reflNodes){ N.dly.disconnect(); N.g.disconnect(); N.f.disconnect(); N.gl.disconnect(); N.gr.disconnect(); } }catch(e){} }
+    hand[w]=mkVoice(w);
+  }
+}
+function setHand(which, drive, panPos, dist01, visible, bg, vec, vClose, palm){
+  if(!audioReady) return;
+  const h=hand[which]; if(!h) return;
+  const now=ctx.currentTime;
+  const NP=h.node.parameters;
+  const set=(name,val,tc)=>{ const pr=NP.get(name); if(pr && isFinite(val)) pr.setTargetAtTime(val, now, tc); };
+  // ★ 방어: AudioParam에 비유한 값(NaN/Infinity)을 쓰면 예외가 던져져 세션이
+  //   통째로 멈춘다("갑자기 잘되다 멈춤"). 어떤 계산이 어긋나도 그 파라미터만
+  //   건너뛰고 나머지는 계속 돌도록, AudioParam 쓰기를 전부 이 헬퍼로 감싼다.
+  const P=(param,val,tc)=>{ if(param && isFinite(val)) param.setTargetAtTime(val, now, tc); };
+  // 반응성 우선: drive 시정수 대폭 단축. 손 움직임에 즉각 반응.
+  set('drive', drive, 0.004);
+  // === B. 도플러 → pitch 미세 변조 ===
+  //  f'/f = c/(c-v)  (다가올 때 v>0). 손 속도 1m/s → 5.1 cents.
+  //  ※ 정직하게 밝힐 점: 물리값 그대로는 거의 안 들린다.
+  //    복합음 피치 JND ≈ 5~6 cents(훈련자), 비훈련자 10~15 cents.
+  //    손 쓸기 속도(~1m/s)의 물리적 도플러는 딱 그 문턱이라 체감이 미미하다.
+  //    → dopAmt로 배율을 걸어 "지각적으로 들리게" 과장한다. 1.0=물리값.
+  //  ※ DelayNode 기반 도플러(지연선 변조)는 Web Audio 스펙상 보간 방식이
+  //    미정의라 브라우저별 아티팩트가 생긴다. 여기선 워클릿 pitch 파라미터를
+  //    직접 움직이므로 그 위험이 없다.
+  const dopAmt=+dopplerEl.value;
+  let pitchVal=+pitchEl.value;
+  if(dopAmt>0 && vClose && isFinite(vClose)){
+    const v=Math.max(-4, Math.min(4, vClose))*dopAmt;
+    const ratio=SPEED_OF_SOUND/Math.max(1, SPEED_OF_SOUND - v);
+    // pitch 파라미터는 2^(pitch-0.5) 배율이므로, 주파수비를 로그로 환산해 더한다.
+    pitchVal = Math.max(0, Math.min(1, pitchVal + Math.log2(ratio)));
+  }
+  set('pitch', pitchVal, 0.02);
+  if(timbre==='bark-friction'){
+    set('rough',     +roughEl.value, 0.03);
+    set('body',      +bodyEl.value, 0.05);
+    set('bright',    +brightEl.value, 0.05);
+    set('reso',      +resoEl.value, 0.05);
+    set('slipRate',  +slipRateEl.value, 0.05);
+    set('slipJit',   +slipJitEl.value, 0.05);
+    set('slipDepth', +slipDepthEl.value, 0.05);
+  } else if(timbre==='water-drops'){  // water: 슬라이더로 배경음/방울 조절
+    set('bedTone',   +bedToneEl.value, 0.05);
+    set('bedVol',    +bedVolEl.value,  0.05);
+    // 거리가 멀수록 기포 사건이 더 성기게 들리도록 밀도만 낮춘다.
+    // 가까움 100% → 최원거리 60%. 개별 방울 볼륨과 배경 물소리는 유지한다.
+    const waterDistance=Math.max(0,Math.min(1,isFinite(dist01)?dist01:0));
+    const distanceDensity=1-0.40*Math.pow(waterDistance,1.15);
+    h.waterDensityScale=distanceDensity;
+    set('density',   (+densityEl.value)*distanceDensity, 0.10);
+    set('bubbleVol', +bubbleVolEl.value, 0.05);
+    set('swirl',     +swirlEl.value, 0.05);
+  } else if(timbre==='wind-flow'){
+    // 바람은 손이 멈춰 있어도 기본 풍속이 0이 아니므로 contact에 항상 바닥값이 있다.
+    // 면적은 중저역 압력, 손날/손가락 틈은 고역, 이동은 난류 비중을 바꾼다.
+    const clamp01=v=>Math.max(0,Math.min(1,isFinite(v)?v:0));
+    const rawArea=clamp01(palm?.area??0.55);
+    const angleAmount=+windAngleEl.value;
+    // 실제 추적값의 중앙 구간을 넓게 쓰고 smoothstep을 적용해 작은 랜드마크 떨림은
+    // 억제하면서, 손바닥 정면과 손날 근처에서는 음색이 명확히 갈라지게 한다.
+    const normalizedArea=clamp01((rawArea-0.12)/0.78);
+    const shapedArea=normalizedArea*normalizedArea*(3-2*normalizedArea);
+    const area=0.55+(shapedArea-0.55)*angleAmount;
+    const face=Math.pow(clamp01(area),1.35);
+    const edge=1-face;
+    const motion=clamp01(palm?.motion??drive);
+    const relFlow=Math.max(0.18,Math.min(1.35,palm?.relativeFlow??(0.45+motion*0.55)));
+    const spread=clamp01(palm?.spread??0.25);
+    const cup=clamp01(palm?.cup??0);
+    const turbAmount=+windTurbEl.value;
+    // 작은 추적 떨림은 억제하고, 실제 휘두름 구간은 돌풍처럼 빠르게 커지게 한다.
+    const gust=Math.pow(motion,1.15);
+    // 정면: 저·중역의 압력과 충돌 에너지가 크게 증가.
+    // 손날: 저역은 거의 사라지고 좁은 틈을 지나는 고역과 난류가 전면으로 나온다.
+    const body=clamp01(0.04+face*0.96+cup*0.12-motion*0.08);
+    const turbulence=Math.max(0,Math.min(2,
+      0.08+edge*0.42+turbAmount*(gust*1.25+spread*0.22+Math.max(0,relFlow-0.35)*0.42)));
+    const hiss=Math.max(0,Math.min(2.5,
+      0.04+edge*1.72+spread*(0.18+edge*0.30)+turbAmount*gust*0.85));
+    // 손날과 정면의 정상상태 에너지 차이를 약 5배로 벌린다.
+    const rest=0.20+Math.pow(face,0.85)*0.90;
+    const contact=bg ? 0 : (+windContactEl.value)
+      * Math.min(2.2,rest+gust*1.25+Math.max(0,relFlow-0.45)*0.30);
+    set('body',body,0.10);
+    set('turbulence',turbulence,motion>0.15?0.035:0.16);
+    set('hiss',hiss,motion>0.15?0.040:0.14);
+    set('contact',contact,bg?0.30:(gust>0.12?0.025:0.12));
+    const W=h.windState;
+    W.area=area; W.motion=motion; W.relativeFlow=relFlow;
+    W.spread=spread; W.cup=cup; W.contact=contact;
+  }
+  // 거리 → 볼륨. 가까울수록 확 크게(부스트), 멀수록 작게. dist01: 0=코앞, 1=멀리
+  const d = dist01||0;
+  // ★ near는 반드시 0~1로 클램프. dist01은 뻗은 구간에서 1을 넘을 수 있는데(1.25까지),
+  //   그러면 near가 음수가 되어 Math.pow(near, 소수)=NaN → AudioParam 크래시로
+  //   "갑자기 멈추는" 버그가 났다. d도 0~1로 제한한다.
+  const dC = Math.max(0, Math.min(1, d));
+  const near = 1-dC;                                  // 0(멀리)~1(코앞), 항상 유효
+  const isWaterScene=timbre==='water-drops';
+  // WaterDrops의 실제 방울은 대부분 1.15kHz 이하, 물살은 45~200Hz다.
+  // 이전 19kHz↔850Hz 필터는 존재하지 않는 대역을 움직여 체감이 약했다.
+  // 가까운 구간은 8kHz로 완전히 열고, 중간부터 실제 방울 대역을 가로질러
+  // 최원거리 220Hz까지 내려가도록 near³ 곡선을 사용한다.
+  const waterOpen=Math.pow(near,3);
+  const waterDistanceCut=bg ? 1800
+    : 220+(8000-220)*waterOpen;
+  const waterShelfDb=bg ? -7 : -16+22*Math.pow(near,0.65);
+  // 거리 감쇠 강화: 멀 때 확실히 작아지게 바닥 대폭↓(0.4→0.12), 곡선 가파르게(1.1→1.7).
+  //  near=1(코앞)→1.3배, near=0(멀리)→0.12배. 배경모드는 일정(0.85).
+  // 거리 볼륨 간극 축소: 바닥 0.12→0.4(멀어도 덜 작게), 곡선 완만(1.7→1.2).
+  //  near=1(코앞)→1.3배, near=0(멀리)→0.4배. 멀 때도 충분히 들림.
+  // 직접음 감쇠: 슬라이더(거리 볼륨차)로 1/r에 얼마나 가깝게 갈지 조절.
+  //  amt=0 → 볼륨 일정(거리감을 DRR에만 의존), 1 → 물리적 1/r에 근접(~15dB 차).
+  //  ★ 바닥값 상향(0.22→0.55): 손을 뻗어도 소리가 너무 작아지지 않게.
+  //    실사용 구간(15~45cm)에서 과하게 떨어지던 문제 대응. 거리감은 볼륨보다
+  //    DRR·초기반사·음색이 만들도록 역할을 옮긴다(intensity-independent cue).
+  const dAmt = +distAmtEl.value;
+  const distGain = bg ? 0.85 : (1.15 - (1.15-0.55)*Math.pow(1-near, 0.9)*dAmt);
+  // 손바닥이 얼굴을 향하면 직접음이 선명해지고, 옆을 향하면 에너지가 반사로 돌아간다.
+  // landmark 방향은 프레임마다 조금 흔들리므로 onResults에서 이미 저역통과한 값을 받는다.
+  const palmFacing = Math.max(0, Math.min(1, palm?.facing ?? 0.5));
+  const palmAmt = bg ? 0 : +palmDirEl.value;
+  const measuredAmount = (!bg && measuredHrtfBuffers.length) ? +hrtfMixEl.value : 0;
+  const turnedAway = 1-palmFacing;
+  const directivityGain = 1 - palmAmt*turnedAway*0.30;
+  if(h.palmShelf) P(h.palmShelf.gain, palmAmt*(-5 + palmFacing*10), 0.08);
+  // 바람 배경은 전역 루프 하나가 담당하므로 손이 안 보이는(bg) 두 보이스는 완전히 닫는다.
+  // 바람 씬의 전역 배경은 그대로 두고 손에서 발생하는 국소 상호작용만 30% 낮춘다.
+  const interactionGain = timbre==='wind-flow' ? 0.70 : 1;
+  // 물은 거리 음색 변화에 더해 직접음도 조금 더 감쇠한다.
+  // 가까움은 그대로, 최원거리에서 28% 낮아지는 완만한 곡선.
+  // 배경 물소리에는 적용하지 않아 장면 전체의 바닥 음량은 유지한다.
+  const waterDistanceVolume=(isWaterScene&&!bg)
+    ? 1-0.28*Math.pow(dC,1.2)
+    : 1;
+  if(isWaterScene){
+    h.waterTone={
+      distance:dC,
+      cut:waterDistanceCut,
+      shelfDb:waterShelfDb,
+      volume:waterDistanceVolume,
+      density:h.waterDensityScale??1,
+    };
+  }
+  const vgain = (timbre==='wind-flow'&&bg) ? 0
+    : visible ? interactionGain*waterDistanceVolume*0.9*(+volEl.value)*distGain*directivityGain : 0;
+  P(h.gain.gain, vgain, 0.05);
+
+  // === B. 거리 → DRR (직접음:잔향 비율) ===
+  //  거리 지각의 핵심. 가까우면 직접음 우세(잔향 적게), 멀면 잔향 비중↑.
+  //  볼륨을 안 줄여도 거리감이 나는 이유가 이것(intensity-independent distance cue).
+  const revAmt = +revAmtEl.value;
+  // 하프는 현의 긴 감쇠가 방을 계속 울리는 성격이라, 같은 공간에서도
+  // 초기반사와 후기잔향을 조금 더 보낸다. 다른 두 음색에는 적용하지 않는다.
+  const sceneEarlyRev = timbre==='harp-strings' ? 1.35 : 1;
+  const sceneLateRev  = timbre==='harp-strings' ? 1.85 : 1;
+  if(h.sendEarly){
+    // 초기반사: 거리에 따라 확실히 증가. 코앞엔 거의 없음(직접음만) → 뻗으면 뚜렷.
+    //  ※ pow(d,0.7)은 원점 근처가 너무 가팔라(손 조금만 움직여도 잔향이 확 붙음)
+    //    지수를 1.4로 올려 근거리에선 완만하고 멀어질수록 붙게 한다.
+    const eG = bg ? 0.28 : (0.03 + 0.80*Math.pow(d, 1.4)) * revAmt * sceneEarlyRev;
+    // 후기잔향: 초기반사보다 완만하게, 항상 약간 존재(공간이 있다는 바닥 단서).
+    const lG = bg ? 0.30 : (0.06 + 0.60*Math.pow(d, 1.1)) * revAmt * sceneLateRev;
+    P(h.sendEarly.gain, eG, 0.08);
+    P(h.sendLate.gain, lG, 0.12);
+    // 초기반사 도착 지연: 가까울수록 직접음 대비 반사가 늦게 옴(시간차↑).
+    //  코앞 ~14ms → 멀리 ~4ms. 이 변화가 "벽까지의 상대 거리" 감각을 만든다.
+    const pd = bg ? 0.008 : (0.014 - 0.010*d);
+    // delayTime은 급변 시 아티팩트가 생기므로 넉넉히 완만하게.
+    P(h.preDelay.delayTime, pd, 0.15);
+  }
+  // 거리 → 음색 변화 (단순 볼륨 감소가 아니라 소리 성격이 달라짐):
+  //  · 가까움: 저역 부스트↑(코앞 압박) + 고역 열림(밝고 또렷)
+  //  · 멀리: 저역 부스트 없음 + 고역 롤오프(둔탁·먹먹) → 공기흡수/잔향비 상승 모사
+  // 하프 샘플에는 이미 실제 공명통 저역이 들어 있다. hand sweep용 근접 저역 부스트를
+  // 더하면 저음 현에서 과도하게 겹쳐 깨지므로 하프에서는 끈다.
+  if(h.shelf){
+    // 물은 멀수록 저역을 새로 크게 만드는 것이 아니라, 남는 저역의 상대적 비중만
+    // 조금 올린다. 기존 near*5dB는 오히려 가까운 물을 가장 저음답게 만들고 있었다.
+    const shelfGain=isWaterScene
+      ? (bg?2.2:0.1+(1-near)*2.7)
+      : (bg?1.5:(timbre==='harp-strings'?0:timbre==='wind-flow'?near*1.3:near*5));
+    P(h.shelf.gain,shelfGain,0.08);
+  }
+  if(h.lp){
+    const cut=isWaterScene
+      ? waterDistanceCut
+      : (bg ? 5500 : 2200+(16000-2200)*Math.pow(near,0.8));
+    P(h.lp.frequency,cut,isWaterScene?0.13:0.06);
+  }
+  // HRTF 위치: 좌우는 "손의 실제 위치(얼굴 기준)"로 결정. 좌/우손 정체성 무관.
+  //   panPos: 음수=왼쪽 귀쪽, 양수=오른쪽 귀쪽 (얼굴폭 단위).
+  //   가까울수록(near↑) 좌우 폭을 더 벌려 방향을 또렷하게.
+  const spread = 0.7 + near*1.1;
+  // 배경모드는 좌우 넓게(감싸는 수중), 정면 중간거리 고정.
+  const px = bg ? (which==='Left'?-0.25:0.25)
+               : Math.max(-0.85, Math.min(0.85, panPos * spread));
+  // pz 최소 거리를 refDistance(0.12)보다 충분히 크게(0.2) 유지 → PannerNode
+  // inverse 거리모델이 코앞에서 급격히 증폭되는 것 방지(얼굴 앞 볼륨 폭증의 주원인).
+  const pz = bg ? -0.4 : (-0.2 - d*1.1);
+  // 미세 위치 흔들림(dynamic cue) — 정면 정위 개선
+  h.jitterPh += 0.09;
+  const jx = Math.sin(h.jitterPh)*0.02;
+  const jz = Math.sin(h.jitterPh*0.7)*0.015;
+  const PN=h.panner;
+  if(PN.positionX){ P(PN.positionX, px+jx, 0.05);
+                    P(PN.positionZ, pz+jz, 0.05); }
+  else if(isFinite(px+jx)&&isFinite(pz+jz)) PN.setPosition(px+jx, -0.05, pz+jz);   // 구형 브라우저 폴백
+
+  // === A. head shadow 적용 ===
+  //  손의 3D 좌표(머리 중심 기준)로 귀별 거리를 구해 ILD·차폐를 직접 계산한다.
+  //  브라우저 HRTF에만 맡기지 않고 좌우 가중치를 명시적으로 통제하는 부분.
+  const mix = +hsMixEl.value;
+  const legacyGain=Math.cos(measuredAmount*Math.PI*0.5);
+  const measuredGain=Math.sin(measuredAmount*Math.PI*0.5);
+  P(h.viaPanner.gain, legacyGain*(1-mix*0.85), 0.05);
+  P(h.hsDirect.gain, legacyGain*mix, 0.05);
+  P(h.hrtfWet.gain, measuredGain, 0.05);
+
+  // 손의 월드 좌표를 머리 로컬 좌표로 한 번만 변환해 모든 직접음 모델이 공유한다.
+  // headShadow는 정면을 +z로 쓰므로 Web Audio의 정면 -z를 다시 뒤집어 전달한다.
+  let listenerVec=vec;
+  if(vec?.valid && spatialListener){
+    _hrtfWorld.x=vec.x;
+    _hrtfWorld.y=-vec.y;
+    _hrtfWorld.z=-Math.max(0.12, vec.z);
+    spatialListener.worldToLocal(_hrtfLocal, _hrtfWorld);
+    _listenerHand.x=_hrtfLocal.x;
+    _listenerHand.y=-_hrtfLocal.y;
+    _listenerHand.z=-_hrtfLocal.z;
+    _listenerHand.distM=Math.hypot(_listenerHand.x,_listenerHand.y,_listenerHand.z);
+    _listenerHand.dist01=vec.dist01;
+    _listenerHand.valid=true;
+    listenerVec=_listenerHand;
+  }
+  if(measuredAmount>0.001 && listenerVec?.valid){
+    const horizontal=Math.max(0.03, Math.hypot(listenerVec.x,listenerVec.z));
+    const azimuth=Math.atan2(listenerVec.x,listenerVec.z)*180/Math.PI;
+    const elevation=Math.atan2(-listenerVec.y,horizontal)*180/Math.PI;
+    updateMeasuredHrtf(h, azimuth, elevation);
+    h.hrtfAz=azimuth; h.hrtfEl=elevation;
+  }
+  if(bg || !vec || !vec.valid){
+    // 배경모드/얼굴 미검출: 좌우 대칭(치우침 없음)
+    P(h.hsL.gain, 1, 0.08);
+    P(h.hsR.gain, 1, 0.08);
+    P(h.hsLpL.frequency, 18000, 0.08);
+    P(h.hsLpR.frequency, 18000, 0.08);
+    P(h.itdL.delayTime, 0, 0.05);
+    P(h.itdR.delayTime, 0, 0.05);
+    h.shadow=null;
+  } else {
+    const S = headShadow(listenerVec, +hsShadowEl.value, +hsIldEl.value);
+    // 시정수 짧게(0.03) — 손 움직임에 좌우감이 즉각 따라오도록.
+    P(h.hsL.gain, S.gL, 0.03);
+    P(h.hsR.gain, S.gR, 0.03);
+    P(h.hsLpL.frequency, S.cutL, 0.04);
+    P(h.hsLpR.frequency, S.cutR, 0.04);
+    // === A. ITD 적용 ===
+    //  delayTime 급변은 아티팩트(피치 스윕/글리치)를 내므로 넉넉히 완만하게(0.06).
+    //  itdAmt=0이면 기존 동작(시간차 없음) → A/B 비교 가능.
+    const ia=+itdAmtEl.value;
+    P(h.itdL.delayTime, S.itdL*ia, 0.06);
+    P(h.itdR.delayTime, S.itdR*ia, 0.06);
+    h.shadow=S;   // 상태표시/진단용
+  }
+
+  // === C. 근접 저역 스테레오 분리 ===
+  //  코앞일수록(near↑) 저역 레이어를 키우고 좌우 시간차를 벌린다.
+  //  → 저역이 머릿속 중앙에 뭉치지 않고 귀를 감싸는 느낌.
+  //  지연은 0.5ms 이하로 제한(그 위는 저역에 콤필터 노치 발생 — 위 측정 참조).
+  const lowAmt=+lowWideEl.value;
+  if(h.lowGain){
+    // 근접할수록 저역 레이어 게인↑. 멀면 0(불필요한 저음 부밍 방지).
+    const lg = (bg || timbre==='harp-strings' || timbre==='wind-flow') ? 0
+      : Math.pow(near, 1.6)*0.55*lowAmt*(1-measuredAmount*0.35);
+    P(h.lowGain.gain, lg, 0.06);
+    // 좌우 시간차: 최대 0.4ms. 손이 있는 쪽 귀가 먼저 듣도록 부호를 맞춘다.
+    const sgn = listenerVec?.valid ? Math.sign(listenerVec.x) : 0;
+    const dt = 0.0004*lowAmt*Math.min(1, Math.abs(panPos||0)*1.5+0.35);
+    P(h.lowDL.delayTime, sgn>0 ? dt : 0, 0.08);
+    P(h.lowDR.delayTime, sgn>0 ? 0 : dt, 0.08);
+  }
+
+  // ============================================================
+  // 확장 엔진 (§3 §4 §5 §7 §9 §12 §14)
+  // ============================================================
+  if(!engineOnEl.checked) return;
+  const distM = (vec&&vec.valid) ? Math.max(0.08, vec.distM) : 0.35;
+
+  // --- §9 위치 보간: 목표 좌표로 지수 접근. 급변 → 클릭 방지 ---
+  //  MediaPipe 좌표를 그대로 쓰지 않고 한 단계 더 매끈하게 만든다.
+  //  (1€ 필터가 이미 화면좌표를 평활화하지만, 3D 좌표·속도는 여기서 다시.)
+  if(vec&&vec.valid){ h.tgtPos.set(vec.x, -vec.y, -vec.z); }
+  else { h.tgtPos.set(which==='Left'?-0.25:0.25, 0, -0.4); }
+  const sm=+smoothEl.value;                     // 0=즉시, 1=아주 느리게
+  const k=1-Math.pow(0.001, 1/Math.max(1,sm*30+1));   // 프레임당 접근 계수
+  h.vel.x=(h.tgtPos.x-h.smPos.x)*k; h.vel.y=(h.tgtPos.y-h.smPos.y)*k; h.vel.z=(h.tgtPos.z-h.smPos.z)*k;
+  h.smPos.add(h.vel);
+
+  // --- §14 리스너 회전 반영: 월드 좌표 → 리스너 로컬 ---
+  //  머리를 돌리면 "공간"이 아니라 "소스 방향"이 바뀐다.
+  spatialListener.worldToLocal(_localPos, h.smPos);
+  const lx=_localPos.x, ly=_localPos.y, lz=_localPos.z;
+  const localDist=Math.max(0.08, Math.hypot(lx,ly,lz));
+
+  // --- §12 거리 감쇠 모델 (linear/inverse/exponential/custom) ---
+  //  ★ 이전 버그: 여기서 나온 dg를 기존 distGain에 "곱해서" 감쇠가 두 번 걸렸다.
+  //    측정 결과 20→50cm에서 -11.5dB로, 물리값(-8dB)보다도 가팔랐다.
+  //    → 곱하지 않고, 기존 곡선을 §12 모델로 "대체"한다(둘 중 하나만 적용).
+  //    vgain에서 distGain 성분을 되나눠 빼고 dg를 다시 곱한다.
+  const dg = distanceGain(localDist, {
+    distanceModel: distModelEl.value,
+    refDistance: 0.18,            // 기준거리를 손 실사용 거리로(코앞 폭증 방지)
+    maxDistance: 1.2,             // 손이 닿는 최대 범위
+    rolloffFactor: +rolloffEl.value,
+  });
+  //  distGain으로 나눠 원래 볼륨을 복원한 뒤 dg만 적용 → 이중 감쇠 제거.
+  //  바닥값 0.55: 팔을 끝까지 뻗어도 20cm 대비 절반 이상은 들리게.
+  //  (거리감은 볼륨이 아니라 DRR·반사·음색이 담당 — 문헌의 intensity-independent cue)
+  const base = vgain/Math.max(1e-6, distGain);
+  //  soft-knee: 바닥에 딱 붙어 평탄해지지 않도록 하한 근처를 완만히 접는다.
+  //  (완전 평탄하면 뻗은 구간에서 거리 변화가 아예 안 느껴짐)
+  const FLOOR=0.50;
+  const dgc = dg>FLOOR ? dg : FLOOR - (FLOOR-dg)*0.35;   // 하한 아래는 1/3 기울기로 계속 감소
+  P(h.gain.gain, base*Math.max(0.38, Math.min(1.25, dgc)), 0.05);
+
+  // --- §3 공기 흡수 (ISO 9613-1) + §4 근접장 EQ ---
+  //  물리 흡음은 이 거리에서 거의 0이라 airExagg로 과장한다(정직히 명시).
+  //  근접(<0.5m)에서는 고역이 오히려 살아 있어야 "코앞" 느낌 → 컷오프를 더 연다.
+  const airEx=+airExaggEl.value;
+  if(airEx>0.01){
+    const airCut=Math.max(900,airCutoffHz(localDist,airEx*40,3));
+    // 이전에는 이 쓰기가 위의 물 전용 거리 필터를 20kHz 부근으로 덮어썼다.
+    // 두 모델 중 더 어두운 컷오프를 택해야 수중 거리 음색이 최종 출력까지 유지된다.
+    const finalCut=isWaterScene ? Math.min(airCut,waterDistanceCut) : airCut;
+    if(isWaterScene&&h.waterTone) h.waterTone.cut=finalCut;
+    P(h.lp.frequency,finalCut,isWaterScene?0.13:0.07);
+  }
+  // §4 Near-field: 거리별 하이셸프. 아주 가까우면 살짝 밝게(존재감),
+  //  0.5m 넘어가면 서서히 어둡게. 볼륨이 아닌 음색으로 거리를 만든다.
+  if(h.nfShelf){
+    const t=Math.max(0, Math.min(1, (0.5-localDist)/0.38));   // 0.12m→1, 0.5m→0
+    // 물은 실제 기포 상단 대역에 맞춰 셸프 기준을 3.5kHz→650Hz로 내린다.
+    P(h.nfShelf.frequency,isWaterScene?650:3500,isWaterScene?0.13:0.07);
+    // 물: 가까울 때 +6dB의 기포 윤곽, 멀 때 -16dB의 고역 셸프.
+    // 0.65 지수로 가까운 절반 구간의 밝기를 더 오래 보존한다.
+    // LPF와 함께 움직여 단순한 볼륨 감소가 아닌 확실한 재질 변화를 만든다.
+    const shelfDb=isWaterScene
+      ? waterShelfDb
+      : -2.5+t*5.5;
+    P(h.nfShelf.gain,shelfDb,isWaterScene?0.13:0.07);
+  }
+
+  // --- §7 Occlusion ---
+  const occ=+occlusionEl.value;
+  if(h.occLP){
+    // 차폐 시: 고역 급감 + 직접음 감소. 0이면 완전 통과.
+    P(h.occLP.frequency, 18000 - occ*(18000-700), 0.1);
+    P(h.occGain.gain, 1 - occ*0.75, 0.1);
+    P(h.hrtfOccLP.frequency, 18000 - occ*(18000-700), 0.1);
+    P(h.hrtfOccGain.gain, 1 - occ*0.75, 0.1);
+  }
+
+  // --- §10 보이스 우선순위 갱신 ---
+  //  손 2개는 항상 'full'이지만, 소스가 늘어나면 이 값으로 등급이 갈린다.
+  const V=voiceManager.acquire(which);
+  V.gain=vgain; V.dist=localDist; V.age=0;
+  h.tier = V.tier || 'full';
+
+  // --- §5 Image Source 초기반사 (6면 계산 → 상위 3개 렌더) ---
+  //  ※ 반사는 비용이 큰 경로라 'full' 등급에서만 갱신한다.
+  //    'simple' 등급 소스는 late reverb만으로 공간감을 얻는다(§10 등급별 처리).
+  const reflAmt = (h.tier==='full') ? +reflAmtEl.value : 0;
+  if(h.reflNodes && reflAmt>0.005){
+    _srcLocal.x=lx; _srcLocal.y=ly; _srcLocal.z=lz;
+    const R=imageSources(h.reflBuf, _srcLocal, currentRoom, currentAbsorb);
+    const active=selectEarlyReflections(h.reflActive, R, 3);
+    for(let i=0;i<h.reflNodes.length;i++){
+      const N=h.reflNodes[i], r=active[i]; if(!r) continue;
+      // 직접음보다 반드시 늦게: 반사 지연 - 직접음 지연 (최소 3ms 보장)
+      const rel=Math.max(0.003, r.delay - localDist/SPEED_OF_SOUND);
+      // delayTime 급변은 아티팩트 → 시정수 넉넉히(0.2s)
+      P(N.dly.delayTime, Math.min(0.11, rel), 0.2);
+      // 차폐되면 반사가 상대적으로 커진다(소리가 돌아서 옴)
+      P(N.g.gain, r.gain*reflAmt*(1+occ*0.6+palmAmt*turnedAway*0.55), 0.12);
+      // 벽 흡음: 흡음률 높을수록 고역이 더 깎임
+      P(N.f.frequency, 1200+(1-currentAbsorb)*9000, 0.15);
+      // 반사 방향 → 좌우 배분 (왼벽 반사는 왼귀 우세)
+      const pan=Math.max(-1,Math.min(1, Math.sin(r.az)));
+      P(N.gl.gain, Math.sqrt(Math.max(0,(1-pan)*0.5)), 0.12);
+      P(N.gr.gain, Math.sqrt(Math.max(0,(1+pan)*0.5)), 0.12);
+    }
+  } else if(h.reflBus){
+    P(h.reflBus.gain, 0, 0.1);
+  }
+  if(h.reflBus && reflAmt>0.005) P(h.reflBus.gain, 1, 0.1);
+  h.localDist=localDist; h.localPos={x:lx,y:ly,z:lz};
+}
+
+// ============================================================
+// MediaPipe Hands — 손바닥 중심 속도 추적
+// ============================================================
+let camera=null, hands=null, faceDet=null, faceMesh=null;
+const HAND_DROPOUT_GRACE_MS=220;
+function mkFilter(){ return {fx:new OneEuro(),fy:new OneEuro(),px:null,py:null,
+  tipsPrev:null, fingerAmt:0, speed:0, confidence:null, prevDistM:null, vClose:0, palmFacing:null,
+  // 빠른 동작에서 handedness score가 잠깐 내려가거나 검출이 몇 프레임 빠져도
+  // 연속음을 끊지 않기 위한 마지막 정상 측정 캐시.
+  lastGoodAt:0, lastStableDrive:0, lastPanPos:0, lastDist01:0.5,
+  lastVec:null, lastPalm:null, lastVisual:null,
+  windVX:0,windVY:0,windPrevVX:0,windPrevVY:0,windMotion:0,
+  windArea:null,windSpread:null,windCup:null,windRelative:0.45}; }
+const filters = { Left:mkFilter(), Right:mkFilter() };
+let latest = [];  // [{label, cx, cy, tips}]
+// 얼굴 위치·크기 (화면 픽셀). face.size = 얼굴 폭(원근 보정용). yaw = 머리 좌우 회전(rad).
+let face = { x:null, y:null, size:null, yaw:0, pitch:0, roll:0 };
+let yawSmooth=0;   // 평활화된 yaw (헤드 트래킹)
+let pitchSmooth=0, rollSmooth=0;   // §14 상하·기울임 회전
+
+async function start(){
+  await initAudio(); if(ctx.state==='suspended') await ctx.resume();
+  hands=new Hands({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+  hands.setOptions({maxNumHands:2, modelComplexity:1, minDetectionConfidence:0.6, minTrackingConfidence:0.6});
+  hands.onResults(onResults);
+
+  faceDet=new FaceDetection({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${f}`});
+  faceDet.setOptions({model:'short', minDetectionConfidence:0.5});
+  faceDet.onResults(onFace);
+
+  // FaceMesh: 눈꺼풀 랜드마크로 눈 감김(EAR) 판정 (깜빡임과 구분).
+  faceMesh=new FaceMesh({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
+  faceMesh.setOptions({maxNumFaces:1, refineLandmarks:true, minDetectionConfidence:0.5, minTrackingConfidence:0.5});
+  faceMesh.onResults(onMesh);
+
+  camera=new Camera(video,{ onFrame:async()=>{
+    await hands.send({image:video});
+    await faceDet.send({image:video});
+    await faceMesh.send({image:video});
+  }, width:1280, height:720 });
+  await camera.start();
+  statusEl.textContent='추적 중…';
+  requestAnimationFrame(loop);
+}
+
+// === 눈 감김 판정 (EAR: Eye Aspect Ratio) + 깜빡임 구분 ===
+//  EAR = 눈 세로거리 / 가로거리. 뜨면 ~0.3, 감으면 ~0.1.
+//  깜빡임(순간)과 구분: EAR가 문턱 아래로 CLOSE_HOLD(0.4초) "지속"되어야 '감음'으로 확정.
+//  다시 뜰 때도 문턱 위로 잠깐 유지되면 '뜸'. → 깜빡임은 무시됨.
+const faceMeshEl=document.getElementById('blackout');
+let eyesClosed=false;           // 확정된 눈 감김 상태
+let earBelowSince=null;         // EAR가 문턱 아래로 내려간 시각(ms)
+let earAboveSince=null;         // EAR가 문턱 위로 올라간 시각(ms)
+let lastEAR=0.3;
+const EAR_CLOSE=0.18, EAR_OPEN=0.24;   // 히스테리시스(감음/뜸 문턱 분리 → 채터링 방지)
+const CLOSE_HOLD=400;                   // 이만큼 지속 감겨야 '감음' 확정 (깜빡임 배제)
+const OPEN_HOLD=120;                    // 이만큼 지속 떠야 '뜸' 확정
+
+function earOf(lm, ids){
+  // ids: [좌, 우, 위1, 아래1, 위2, 아래2] (가로 양끝 + 세로 2쌍)
+  const p=(i)=>lm[i];
+  const hor=Math.hypot(p(ids[0]).x-p(ids[1]).x, p(ids[0]).y-p(ids[1]).y)+1e-6;
+  const v1=Math.hypot(p(ids[2]).x-p(ids[3]).x, p(ids[2]).y-p(ids[3]).y);
+  const v2=Math.hypot(p(ids[4]).x-p(ids[5]).x, p(ids[4]).y-p(ids[5]).y);
+  return (v1+v2)/(2*hor);
+}
+function onMesh(res){
+  if(!res.multiFaceLandmarks || !res.multiFaceLandmarks.length){
+    // 얼굴이 안 잡히면 눈 상태 판단 보류(마지막 상태 유지, 타이머 리셋).
+    earBelowSince=earAboveSince=null; return;
+  }
+  const lm=res.multiFaceLandmarks[0];
+  // 좌/우 눈 EAR 평균. (MediaPipe FaceMesh 표준 눈꺼풀 인덱스)
+  const earL=earOf(lm,[33,133, 159,145, 158,153]);   // 왼눈(화면 기준)
+  const earR=earOf(lm,[362,263, 386,374, 385,380]);  // 오른눈
+  const ear=(earL+earR)/2; lastEAR=ear;
+  // === §14 pitch / roll 추정 (FaceMesh 랜드마크) ===
+  //  roll = 두 눈을 잇는 선의 기울기 → 머리를 갸웃하면 소스가 반대로 기울어야 함.
+  //  pitch = 코끝(1)과 눈-입 중간선의 상대 높이 → 고개를 끄덕이면 상하 정위 변화.
+  //  ※ 단안 카메라 추정이라 절대각은 부정확하다. 상대 변화만 쓰고 범위를 좁게 클램프.
+  const eL=lm[33], eR=lm[263], nose=lm[1], chin=lm[152], brow=lm[10];
+  if(eL&&eR&&nose&&chin&&brow){
+    face.roll = Math.max(-0.6, Math.min(0.6, -Math.atan2(eR.y-eL.y, eR.x-eL.x)));
+    const eyeMidY=(eL.y+eR.y)/2;
+    const faceH=Math.max(1e-4, chin.y-brow.y);
+    // 코가 눈높이보다 아래로 얼마나 내려와 있나 → 정면 기준값에서의 편차
+    const rel=(nose.y-eyeMidY)/faceH;
+    face.pitch = Math.max(-0.5, Math.min(0.5, (rel-0.30)*2.2));
+  }
+  const now=performance.now();
+  // 히스테리시스 + 지속시간으로 감음/뜸 확정 (깜빡임 = 짧아서 무시됨).
+  if(ear < EAR_CLOSE){
+    earAboveSince=null;
+    if(earBelowSince==null) earBelowSince=now;
+    if(!eyesClosed && now-earBelowSince>=CLOSE_HOLD) eyesClosed=true;   // 0.4s 지속 → 감음
+  } else if(ear > EAR_OPEN){
+    earBelowSince=null;
+    if(earAboveSince==null) earAboveSince=now;
+    if(eyesClosed && now-earAboveSince>=OPEN_HOLD) eyesClosed=false;     // 뜸
+  } else {
+    // 중간(문턱 사이): 타이머 유지(확정 안 함) → 애매한 반쯤 감김에서 채터링 없음.
+  }
+}
+
+// 얼굴 추적 결과 → 화면상 얼굴 중심·크기 + 머리 회전(yaw)
+let _faceDbg=false;
+function onFace(res){
+  if(res.detections && res.detections.length){
+    const det=res.detections[0];
+    const d=det.boundingBox;                  // xCenter,yCenter,width,height (0~1)
+    face.x=(1-d.xCenter)*canvas.width;        // 거울 보정
+    face.y=d.yCenter*canvas.height;
+    face.size=d.width*canvas.width;           // 얼굴 폭(px) = 원근 기준
+    // 첫 검출 1회 구조 로그 (키포인트 필드명 확인용)
+    if(!_faceDbg){ _faceDbg=true; console.log('[face] detection keys:', Object.keys(det), det); }
+    // === B. 헤드 트래킹: 키포인트로 머리 좌우 회전(yaw) 추정 ===
+    //  레거시 solution은 landmarks/keypoints 등 필드명이 제각각 → 여러 후보 시도.
+    const kp = det.keypoints || det.landmarks || det.locationData?.relativeKeypoints
+             || det.locationData?.relative_keypoints;
+    if(kp && kp.length>=3){
+      // [0]우눈 [1]좌눈 [2]코끝 (비거울). 코가 눈중앙에서 치우친 정도 → yaw.
+      const nx=(p)=> (p.x!=null?p.x:p[0]);   // {x,y} 또는 [x,y] 모두 대응
+      const eyeMidX=(nx(kp[0])+nx(kp[1]))/2;
+      const eyeDist=Math.abs(nx(kp[1])-nx(kp[0]))+1e-4;
+      const noseOff=(nx(kp[2])-eyeMidX)/eyeDist;
+      face.yaw=Math.max(-0.9, Math.min(0.9, -noseOff*1.6));   // 거울 보정 부호, ±~50°
+    } else {
+      // 키포인트가 없으면: 얼굴 박스 중심의 화면상 좌우 위치를 대체 단서로(약함).
+      //  머리를 돌리면 얼굴이 화면에서 좌우로 약간 이동 → 근사 yaw.
+      face.yaw = Math.max(-0.6, Math.min(0.6, (d.xCenter-0.5)*1.2));
+    }
+  } else {
+    face.x=face.y=face.size=null;
+  }
+}
+document.getElementById('start').addEventListener('click', ()=>{ start().catch(e=>statusEl.textContent='오류: '+e.message); });
+
+const DEADZONE=120;    // px/s: 이하 속도는 무음 (미세 흔들림 무시)
+const FULLSPEED=1500;  // px/s: 최대 소리
+let resT=performance.now();
+
+// 손-얼굴 3D 거리 → 0(가까움)~1(멀리).
+//  · 화면상 좌우/상하 거리(2D) + 깊이차(Z)를 결합.
+//  · 깊이(Z)는 손 크기와 얼굴 크기 비율로 추정:
+//    실제 손과 얼굴이 같은 깊이면 손폭/얼굴폭 ≈ 일정(HAND_FACE_RATIO).
+//    이 값보다 손이 크면(=카메라에 더 가까움) 앞으로, 작으면 뒤로.
+const HAND_FACE_RATIO = 0.82;    // 팔을 얼굴 옆에 뒀을 때 손폭/얼굴폭 기준값
+// 손-얼굴 3D 거리 → 0(가까움)~1(멀리). wood_scrape의 검증된 미터-기반 방식 이식.
+//  손을 정면으로 뻗으면(손이 커짐) 깊이 z가 크게 증가 → 거리 확실히 멀어짐.
+const FACE_WIDTH_M = 0.15;   // 얼굴 폭(m) = 픽셀→미터 척도
+// 머리 중심 기준 손의 3D 좌표(m)를 계산. head shadow 모델이 이 좌표를 그대로 쓴다.
+//  반환: {x:좌(-)/우(+), y:위(-)/아래(+), z:앞으로 뻗은 정도, distM, dist01}
+//  ※ 예전엔 dist01 스칼라만 반환하고 x,y,z를 버렸는데, 귀별 거리 계산에 필요해서 다 넘긴다.
+function handFaceVec(hx, hy, handSize){
+  if(face.x==null || !face.size) return {x:0, y:0, z:0.3, distM:0.3, dist01:0.35, valid:false};
+  const mPerPx = FACE_WIDTH_M / face.size;
+  // 좌우·상하: 얼굴 중심 대비 오프셋(m)
+  const x = (hx-face.x) * mPerPx;
+  const y = (hy-face.y) * mPerPx;
+  // 깊이 z: 손/얼굴 크기비로 "정면 앞으로 뻗은 정도"(m). 뻗으면 손 커짐→rel↑→z↑.
+  let z = 0;
+  if(handSize){
+    const rel = (handSize/face.size) / HAND_FACE_RATIO;   // 1이면 귀 옆(머리 평면)
+    const over = Math.max(0, rel-1);
+    z = Math.min(0.9, 0.9*over*over + 0.35*over);          // 뻗을수록 강하게 멀어짐
+  }
+  // 머리 중심~손 실제 거리(m) → 0~1.
+  //  ★ 실사용 범위 반영: 체험 중 팔을 쭉 뻗는 일은 거의 없고, 실제로 쓰는 구간은
+  //    대략 15~45cm다. 예전엔 0.12~0.7m를 0~1에 펼쳐서 손을 조금만 뻗어도
+  //    dist01이 급상승 → 소리가 확 작아졌다.
+  //    → 범위를 0.12~0.50m로 좁히고, 그 위(뻗은 상태)는 완만하게 포화시킨다.
+  const distM = Math.hypot(x, y, z);
+  const DIST_NEAR=0.12, DIST_FAR=0.50;
+  let dist01 = (distM-DIST_NEAR)/(DIST_FAR-DIST_NEAR);
+  // 0.5m를 넘어가면 기울기를 1/4로 줄여 "더 뻗어도 크게 안 작아지게" 한다.
+  if(dist01>1) dist01 = 1 + (dist01-1)*0.25;
+  dist01 = Math.max(0, Math.min(1.25, dist01));
+  return {x, y, z, distM, dist01, valid:true};
+}
+
+// 손목(0)·검지 MCP(5)·새끼 MCP(17)의 외적으로 3D 손바닥 법선을 만든다.
+// 바람에서는 법선의 절댓값(막는 면적), 부호(손바닥/손등), 손가락 틈과 오므림을 모두 쓴다.
+function palmPoseFromLandmarks(lm, label){
+  const wrist=lm[0], index=lm[5], pinky=lm[17];
+  const ax=index.x-wrist.x, ay=index.y-wrist.y, az=index.z-wrist.z;
+  const bx=pinky.x-wrist.x, by=pinky.y-wrist.y, bz=pinky.z-wrist.z;
+  const nz=ax*by-ay*bx;
+  const nx=ay*bz-az*by, ny=az*bx-ax*bz;
+  const len=Math.hypot(nx,ny,nz);
+  if(!isFinite(len) || len<1e-5) return {nx:0,ny:0,nz:0,facing:0.5,area:0.5,spread:0.25,cup:0};
+  const sign=label==='Left' ? -1 : 1;
+  const nnx=nx/len*sign, nny=ny/len*sign, nnz=nz/len*sign;
+  const d3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+  const palmWidth=Math.max(1e-5,d3(lm[5],lm[17]));
+  const fingerTips=[8,12,16,20];
+  let gaps=0;
+  for(let i=0;i<fingerTips.length-1;i++) gaps+=d3(lm[fingerTips[i]],lm[fingerTips[i+1]])/palmWidth;
+  const spread=Math.max(0,Math.min(1,(gaps/3-0.16)/0.58));
+  const mcps=[5,9,13,17];
+  let extension=0;
+  for(let i=0;i<4;i++) extension+=d3(wrist,lm[fingerTips[i]])/Math.max(1e-5,d3(wrist,lm[mcps[i]]));
+  extension/=4;
+  const cup=Math.max(0,Math.min(1,(1.72-extension)/0.62));
+  return {
+    nx:nnx, ny:nny, nz:nnz,
+    facing:Math.max(0,Math.min(1,(nnz+1)*0.5)),
+    // 가상 바람은 카메라에서 사용자 쪽으로 분다. 손바닥/손등 모두 넓게 보이면 면적이 같다.
+    area:Math.max(0,Math.min(1,Math.abs(nnz))),
+    spread,cup,
+  };
+}
+function palmFacingFromLandmarks(lm, label){
+  return palmPoseFromLandmarks(lm,label).facing;
+}
+// 하위호환: 기존 호출부가 쓰던 스칼라 버전
+function handFaceDist(hx, hy, handSize){ return handFaceVec(hx,hy,handSize).dist01; }
+
+// ============================================================
+// A. Head shadow / 구형 머리 모델 (문헌: 구형 머리 반경 ≈ 9.19cm, Neumann KU100 기준)
+// ------------------------------------------------------------
+//  기존엔 PannerNode에 좌표만 던지고 브라우저 내장 HRTF에 좌우 정위를 전적으로 맡겼다.
+//  → 가중치가 코드에 안 드러나고 통제도 안 됨. 여기서 명시적으로 계산한다.
+//
+//  귀 위치를 머리 중심 기준 (±HEAD_R, 0, 0)에 두고, 손↔각 귀의 실제 거리로:
+//   1) ILD(레벨차)  : 1/r 거리감쇠 → 가까울수록 좌우 차이가 급격히 벌어짐(근접장 특성)
+//   2) head shadow  : 반대쪽 귀는 머리에 가려짐 → 고역 저역통과(머리가 저역통과 필터로 작용)
+//   3) 파랄랙스     : 근거리는 구면파라 좌/우 귀가 서로 다른 각도로 소리를 받음
+//
+//  ※ 1/r은 선형이 아니라 반비례라, 요청하신 "가까울수록 조금 더 가중"이 물리적으로 자동 성립.
+//    (예: 손이 왼귀 10cm/오른귀 25cm → 레벨비 2.5배. 같은 각도라도 멀면 차이가 줄어듦.)
+const HEAD_R = 0.0919;        // 구형 머리 반경(m) — 문헌값
+const EAR_BACK = 0.015;       // 귀는 머리 중심보다 약간 뒤 → 전후 판별 단서
+const SPEED_OF_SOUND = 343;   // m/s (20°C)
+
+// ============================================================
+// §1 · §14 · §15 — 공간 좌표계 / Listener / Source
+// ------------------------------------------------------------
+//  머리 중심을 원점으로 하는 로컬 좌표계(오른손 좌표계, Web Audio와 동일):
+//    (0,0,0)      머리 중심
+//    (0,0,-0.3)   얼굴 앞 30cm
+//    (0.15,0,0)   오른쪽 귀 방향
+//    (0,0.2,-0.1) 약간 위쪽 전방
+//  Three.js Camera와 동기화 가능(같은 규약 + setFromCamera 제공).
+// ============================================================
+class Vec3 {
+  constructor(x=0,y=0,z=0){ this.x=x; this.y=y; this.z=z; }
+  set(x,y,z){ this.x=x; this.y=y; this.z=z; return this; }
+  copy(v){ this.x=v.x; this.y=v.y; this.z=v.z; return this; }
+  add(v){ this.x+=v.x; this.y+=v.y; this.z+=v.z; return this; }
+  sub(v){ this.x-=v.x; this.y-=v.y; this.z-=v.z; return this; }
+  scale(s){ this.x*=s; this.y*=s; this.z*=s; return this; }
+  length(){ return Math.hypot(this.x,this.y,this.z); }
+  clone(){ return new Vec3(this.x,this.y,this.z); }
+  // GC 최소화(§11): 결과를 out에 쓰고 새 객체를 만들지 않는다.
+  static subTo(out,a,b){ out.x=a.x-b.x; out.y=a.y-b.y; out.z=a.z-b.z; return out; }
+}
+// Euler(yaw,pitch,roll) — 라디안. yaw=좌우(Y축), pitch=상하(X축), roll=기울임(Z축).
+class Euler {
+  constructor(yaw=0,pitch=0,roll=0){ this.yaw=yaw; this.pitch=pitch; this.roll=roll; }
+  set(yaw,pitch,roll){ this.yaw=yaw; this.pitch=pitch; this.roll=roll; return this; }
+}
+// 리스너: 위치와 회전을 "독립적으로" 갱신 가능(§1 요구).
+class SpatialListener {
+  constructor(){
+    this.position=new Vec3(0,0,0);
+    this.rotation=new Euler(0,0,0);
+    // 회전행렬(월드→리스너 로컬). 매 갱신마다 재사용해 할당을 피한다(§11).
+    this._m=new Float32Array(9);
+    this._tmp=new Vec3();
+    this.updateMatrix();
+  }
+  // yaw→pitch→roll 순 회전의 전치(=역행렬, 직교행렬이므로)를 만든다.
+  //  월드 벡터에 곱하면 리스너 기준 좌표가 나온다 → §14 "공간이 아니라 소스가 회전"
+  updateMatrix(){
+    const {yaw,pitch,roll}=this.rotation;
+    const cy=Math.cos(yaw),   sy=Math.sin(yaw);
+    const cp=Math.cos(pitch), sp=Math.sin(pitch);
+    const cr=Math.cos(roll),  sr=Math.sin(roll);
+    // R = Ry(yaw)·Rx(pitch)·Rz(roll) 의 각 행(=전치의 열)
+    const m=this._m;
+    m[0]= cy*cr + sy*sp*sr;  m[1]= cp*sr;  m[2]= -sy*cr + cy*sp*sr;
+    m[3]=-cy*sr + sy*sp*cr;  m[4]= cp*cr;  m[5]=  sy*sr + cy*sp*cr;
+    m[6]= sy*cp;             m[7]=-sp;     m[8]=  cy*cp;
+    return this;
+  }
+  // 월드 좌표 → 리스너 로컬 좌표 (out에 씀, 할당 없음)
+  worldToLocal(out, world){
+    const t=this._tmp;
+    t.x=world.x-this.position.x; t.y=world.y-this.position.y; t.z=world.z-this.position.z;
+    const m=this._m;
+    out.x=m[0]*t.x+m[1]*t.y+m[2]*t.z;
+    out.y=m[3]*t.x+m[4]*t.y+m[5]*t.z;
+    out.z=m[6]*t.x+m[7]*t.y+m[8]*t.z;
+    return out;
+  }
+  // Three.js Camera 동기화(§1). camera.position / camera.rotation(Euler, YXZ) 사용.
+  setFromCamera(camera){
+    if(!camera) return this;
+    const p=camera.position, r=camera.rotation;
+    this.position.set(p.x,p.y,p.z);
+    this.rotation.set(r.y||0, r.x||0, r.z||0);
+    return this.updateMatrix();
+  }
+  // 편의: 정면 벡터(Web Audio listener 동기화용)
+  forward(out){ const m=this._m; out.x=-m[6]; out.y=-m[7]; out.z=-m[8]; return out; }
+  up(out){ const m=this._m; out.x=m[3]; out.y=m[4]; out.z=m[5]; return out; }
+}
+
+// ============================================================
+// §12 — 거리 감쇠 모델 (Linear / Inverse / Exponential / Custom)
+// ------------------------------------------------------------
+//  Web Audio PannerNode의 세 모델과 같은 정의를 쓰되, 우리가 직접 계산해
+//  HRTF 경로 밖(head shadow 직결 경로)에서도 일관되게 적용되도록 한다.
+// ============================================================
+const DISTANCE_MODELS = {
+  linear: (d, ref, max, rolloff)=>
+    1 - rolloff*(Math.min(Math.max(d,ref),max)-ref)/Math.max(1e-6,max-ref),
+  inverse: (d, ref, max, rolloff)=>
+    ref/(ref + rolloff*(Math.max(d,ref)-ref)),
+  exponential: (d, ref, max, rolloff)=>
+    Math.pow(Math.max(d,ref)/ref, -rolloff),
+};
+// customCurve: [{d, g}, ...] 를 주면 선형보간. 없으면 위 3종 사용.
+function distanceGain(d, opt){
+  const ref=opt.refDistance ?? 0.12, max=opt.maxDistance ?? 8, ro=opt.rolloffFactor ?? 1;
+  if(opt.customCurve && opt.customCurve.length>=2){
+    const c=opt.customCurve;
+    if(d<=c[0].d) return c[0].g;
+    if(d>=c[c.length-1].d) return c[c.length-1].g;
+    for(let i=1;i<c.length;i++){
+      if(d<=c[i].d){
+        const t=(d-c[i-1].d)/Math.max(1e-9,c[i].d-c[i-1].d);
+        return c[i-1].g + t*(c[i].g-c[i-1].g);
+      }
+    }
+  }
+  const fn=DISTANCE_MODELS[opt.distanceModel||'inverse']||DISTANCE_MODELS.inverse;
+  return Math.max(0, Math.min(4, fn(d, ref, max, ro)));
+}
+
+// ============================================================
+// §3 — ISO 9613-1 대기 흡음 (공기 흡수)
+// ------------------------------------------------------------
+//  ★ 정직하게 밝힐 점: 이 프로젝트의 거리 범위(0.12~0.7m)에서 실제 공기 흡수는
+//    16kHz에서도 0.26dB, 8kHz에서 0.07dB로 사실상 들리지 않는다(계산 검증함).
+//    그럼에도 "거리↑ → 고역↓"는 지각적으로 매우 강한 거리 단서라, 게임/VR에서는
+//    관행적으로 과장해서 쓴다. 여기서도 물리식을 정확히 구현하되 airExaggerate
+//    배율을 곱해 쓴다. 배율 1.0 = 물리값(거의 안 들림).
+//  → 물리 모사가 아니라 "지각적 강조"임을 명시한다.
+// ============================================================
+function airAbsorptionDbPerM(f, T_C=20, hr=50, pa=101.325){
+  const T=T_C+273.15, T0=293.15, pr=101.325;
+  const C=-6.8346*Math.pow(273.16/T,1.261)+4.6151;
+  const psat=pr*Math.pow(10,C);
+  const h=hr*(psat/pr)/(pa/pr);
+  const frO=(pa/pr)*(24+4.04e4*h*(0.02+h)/(0.391+h));
+  const frN=(pa/pr)*Math.pow(T/T0,-0.5)*(9+280*h*Math.exp(-4.170*(Math.pow(T/T0,-1/3)-1)));
+  return 8.686*f*f*(
+    1.84e-11*Math.pow(pa/pr,-1)*Math.pow(T/T0,0.5)
+    + Math.pow(T/T0,-2.5)*(
+        0.01275*Math.exp(-2239.1/T)/(frO+f*f/frO)
+      + 0.1068*Math.exp(-3352.0/T)/(frN+f*f/frN)));
+}
+// 거리 d(m)에서 "고역이 몇 dB 깎이는가"를 컷오프 주파수로 환산.
+//  물리 흡음이 targetDb에 도달하는 주파수를 찾아 그걸 저역통과 컷오프로 쓴다.
+function airCutoffHz(d, exaggerate=1, targetDb=3){
+  const dd=Math.max(0.01,d)*Math.max(0.01,exaggerate);
+  // 이분 탐색: α(f)·d = targetDb 인 f
+  let lo=500, hi=20000;
+  for(let i=0;i<24;i++){
+    const mid=Math.sqrt(lo*hi);
+    if(airAbsorptionDbPerM(mid)*dd < targetDb) lo=mid; else hi=mid;
+  }
+  return Math.max(700, Math.min(20000, Math.sqrt(lo*hi)));
+}
+
+// ============================================================
+// §5 — Image Source Method (거울상 반사) — 6면 직육면체
+// ------------------------------------------------------------
+//  벽마다 소스를 거울반사시켜 가상 음원을 만들고, 리스너까지의 거리로
+//  지연·감쇠를 계산한다. 소스/리스너가 움직이면 실시간 갱신된다.
+//  ※ 브라우저 한계: 반사마다 DelayNode+필터를 두면 손 2개×6면=12체인.
+//    delayTime을 매 프레임 바꾸면 아티팩트가 나므로(앞서 확인) 시정수를
+//    넉넉히 주고, 1차 반사만 쓴다(2차 이상은 late reverb가 대신).
+// ============================================================
+const WALL_ABSORB = {   // 문헌 표준 흡음계수(중역 기준)
+  concrete:0.02, plaster:0.03, brick:0.03, glass:0.05,
+  wood:0.10, carpet:0.40, curtain:0.50, acoustic:0.80,
+};
+// 방: 리스너를 중심 근처에 두고 6면까지의 거리(m)
+function makeRoom(w=4, h=3, d=6){
+  return { w, h, d,
+    // 리스너 기준 각 벽까지 거리(중앙에 서 있다고 가정)
+    walls:[
+      {n:'left',   axis:'x', sign:-1, dist:w/2},
+      {n:'right',  axis:'x', sign:+1, dist:w/2},
+      {n:'floor',  axis:'y', sign:-1, dist:h/2},
+      {n:'ceil',   axis:'y', sign:+1, dist:h/2},
+      {n:'front',  axis:'z', sign:-1, dist:d/2},
+      {n:'rear',   axis:'z', sign:+1, dist:d/2},
+    ]};
+}
+//  각 벽의 1차 거울상까지 거리 → [{delay(s), gain, az}]
+//  out 배열을 재사용해 프레임마다 할당하지 않는다(§11).
+function imageSources(out, srcLocal, room, absorb){
+  const a=1-Math.max(0.01,Math.min(0.99,absorb));   // 반사 계수(에너지 아닌 진폭 근사)
+  for(let i=0;i<room.walls.length;i++){
+    const W=room.walls[i];
+    const p=srcLocal[W.axis];
+    // 거울상 좌표: 벽 평면(±dist)에 대해 반사
+    const mirrored = 2*W.sign*W.dist - p;
+    let dx=srcLocal.x, dy=srcLocal.y, dz=srcLocal.z;
+    if(W.axis==='x') dx=mirrored; else if(W.axis==='y') dy=mirrored; else dz=mirrored;
+    const dist=Math.max(0.05, Math.hypot(dx,dy,dz));
+    const o=out[i] || (out[i]={});
+    o.dist=dist;
+    o.delay=dist/SPEED_OF_SOUND;          // 도달 시간
+    o.gain=a/Math.max(0.3,dist);           // 1/r 확산 + 벽 흡음
+    o.az=Math.atan2(dx, -dz);              // 반사가 오는 방향(좌우 배분용)
+    o.name=W.n;
+  }
+  out.length=room.walls.length;
+  return out;
+}
+
+// 6면 후보 가운데 직접음에 가장 빨리, 크게 도착하는 반사만 남긴다.
+// 배열과 객체를 재사용해 추적 프레임마다 GC를 만들지 않는다.
+function selectEarlyReflections(out, candidates, count){
+  let usedMask=0;
+  let selected=0;
+  for(let slot=0;slot<count;slot++){
+    let best=-1, bestScore=-Infinity;
+    for(let i=0;i<candidates.length;i++){
+      if(usedMask & (1<<i)) continue;
+      const r=candidates[i];
+      // 같은 세기면 더 이른 반사를 우선한다. 80ms 뒤의 반사는 late reverb가 담당한다.
+      const score=r.gain/(0.004+r.delay);
+      if(score>bestScore){ bestScore=score; best=i; }
+    }
+    if(best<0) break;
+    usedMask |= 1<<best;
+    out[slot]=candidates[best];
+    selected++;
+  }
+  out.length=selected;
+  return out;
+}
+
+// ============================================================
+// §6 — Sabine 잔향시간
+//   RT60 = 0.161·V / A,  A = Σ(αᵢ·Sᵢ)
+// ============================================================
+function sabineRT60(room, absorb){
+  const {w,h,d}=room;
+  const V=w*h*d;
+  const S=2*(w*h + w*d + h*d);
+  const A=Math.max(0.5, absorb*S);
+  return Math.max(0.08, Math.min(4, 0.161*V/A));
+}
+
+// ============================================================
+// §10 — 다중 소스: 우선순위 + 등급별 처리 + 풀링
+// ------------------------------------------------------------
+//  ★ 측정으로 확인한 제약: 풀 체인은 보이스당 약 59노드다. 30소스면 1770노드에
+//    파라미터 쓰기 초당 11만 회 → 브라우저에서 무리다(측정: 2손 300프레임에
+//    37,200회 쓰기).
+//  → 해결: 모든 소스를 똑같이 처리하지 않는다. 우선순위로 정렬해
+//     상위 N개만 풀 체인(ITD·6면반사·근접장), 나머지는 간소 체인(패닝+거리)으로.
+//     이건 게임 오디오 엔진의 표준 기법(voice management)이다.
+//
+//  우선순위 = 가까울수록 · 클수록 · 최근 활성일수록 높음.
+// ============================================================
+const VOICE_TIERS = { full: 4, simple: 26 };   // 풀 4 + 간소 26 = 30소스
+class VoiceManager {
+  constructor(){ this.sources=[]; this.pool=[]; }
+  // 소스 등록(풀에서 재사용). id로 같은 소스를 계속 추적.
+  acquire(id){
+    let s=this.sources.find(x=>x.id===id);
+    if(s){ s.alive=true; return s; }
+    s=this.pool.pop() || {id:null, gain:0, dist:1, age:0, tier:'simple', node:null};
+    s.id=id; s.alive=true; s.age=0;
+    this.sources.push(s);
+    return s;
+  }
+  release(id){
+    const i=this.sources.findIndex(x=>x.id===id);
+    if(i>=0){ const s=this.sources[i]; this.sources.splice(i,1); s.id=null; s.node=null; this.pool.push(s); }
+  }
+  // 매 프레임: 우선순위 계산 후 등급 배정. 배열 재사용(§11 GC 최소화).
+  update(){
+    const S=this.sources;
+    for(let i=0;i<S.length;i++){
+      const s=S[i];
+      // 가까울수록·클수록 우선. age가 커지면(오래 조용) 우선순위 하락.
+      s.priority = s.gain / Math.max(0.05, s.dist*s.dist) - s.age*0.001;
+    }
+    S.sort((a,b)=>b.priority-a.priority);
+    for(let i=0;i<S.length;i++){
+      S[i].tier = i<VOICE_TIERS.full ? 'full'
+                : i<VOICE_TIERS.full+VOICE_TIERS.simple ? 'simple' : 'muted';
+      S[i].age++;
+    }
+    return S;
+  }
+  get count(){ return this.sources.length; }
+  stats(){
+    let f=0,s=0,m=0;
+    for(const v of this.sources){ if(v.tier==='full')f++; else if(v.tier==='simple')s++; else m++; }
+    return {full:f, simple:s, muted:m, total:this.sources.length};
+  }
+}
+const voiceManager = new VoiceManager();
+// 반대쪽 귀 차폐 정도(0~1) → 저역통과 컷오프(Hz). 차폐 클수록 어두워짐.
+const shadowCutHz = s => 1200 + (18000-1200)*Math.pow(1-s, 1.5);
+function headShadow(v, shadowAmt, ildAmt){
+  // v: handFaceVec 결과(머리 중심 기준 m). 좌귀=-x쪽, 우귀=+x쪽.
+  const ear = (sign)=>{
+    const ex = sign*HEAD_R, ez = -EAR_BACK;
+    const dx = v.x-ex, dy = v.y, dz = v.z-ez;
+    return {d: Math.max(0.02, Math.hypot(dx,dy,dz)), dx, dz};
+  };
+  const L = ear(-1), R = ear(+1);
+  // --- 1) ILD: 1/r 감쇠. 가까울수록 좌우비가 커진다(근접장 저역 ILD의 주 원인). ---
+  //  기준을 두 귀 중 가까운 쪽으로 잡아 전체 볼륨은 거리감쇠(distGain)에 맡기고,
+  //  여기서는 "좌우 비율"만 만든다.
+  const near = Math.min(L.d, R.d);
+  let gL = near/L.d, gR = near/R.d;          // 0~1, 가까운 귀가 1
+  // ildAmt로 강도 조절(0=차이없음, 1=물리 그대로)
+  gL = 1 + (gL-1)*ildAmt;
+  gR = 1 + (gR-1)*ildAmt;
+  // --- 2) head shadow: 손이 머리 반대편에 있으면 그 귀는 가려짐 ---
+  //  차폐량 = 귀 법선(±x)과 "귀→손" 방향의 각도. 손이 귀 뒤편(머리 너머)일수록 1에 가까움.
+  //  c = 귀 법선(±x)과 "귀→손" 방향의 코사인.
+  //    c>0  : 손이 그 귀 바깥쪽 = 트임(차폐 0)
+  //    c<0  : 손이 머리 너머 = 가림. c=-1(정반대)에서 최대.
+  //  ※ 정면(c≈0)은 두 귀 다 트여 있어야 하므로 차폐 0이 되어야 한다.
+  //    (예전 식은 c=0에서도 0.2가 남아 정면이 먹먹해졌음.)
+  //  단, 정면 소스는 두 귀 모두 "약간 안쪽"(c가 살짝 음수)이라 그대로 쓰면 양쪽이 다 먹먹해진다.
+  //  실제로는 머리를 돌아 들어가야 차폐되므로, DEAD(불감대)를 넘어선 만큼만 차폐로 센다.
+  const DEAD=0.35;
+  const occl = (E, sign)=>{
+    const c = (sign*E.dx)/E.d;
+    return Math.max(0, (-c-DEAD)/(1-DEAD)) * shadowAmt;
+  };
+  const sL = occl(L,-1), sR = occl(R,+1);
+  // --- 4) ITD: Woodworth 구형 머리 모델 τ = r(θ + sinθ)/c ---
+  //  θ = 정중면(정면)에서 잰 방위각. 손이 오른쪽이면 왼귀가 늦게 듣는다.
+  //  ※ 두 귀 거리차(L.d-R.d)/c 로 계산할 수도 있지만, 그건 직선거리라
+  //    머리를 "돌아가는" 경로(회절)를 무시해 ITD를 과소평가한다.
+  //    Woodworth는 회절 경로를 반영하므로 문헌 표준.
+  const th = Math.atan2(v.x, Math.max(0.01, v.z + EAR_BACK));   // 정면=0, 오른쪽=+
+  const thC = Math.max(-Math.PI/2, Math.min(Math.PI/2, th));    // ±90°로 클램프
+  const tau = HEAD_R*(Math.abs(thC) + Math.sin(Math.abs(thC)))/SPEED_OF_SOUND;
+  // 먼 쪽 귀에 지연을 건다. th>0(오른쪽) → 왼귀가 늦음.
+  const dL = thC>0 ? tau : 0, dR = thC>0 ? 0 : tau;
+  return { gL, gR, cutL: shadowCutHz(sL), cutR: shadowCutHz(sR),
+           itdL: dL, itdR: dR, azimuth: thC,
+           // --- 3) 파랄랙스: 각 귀가 실제로 보는 방위각 차이(진단·시각화용) ---
+           azL: Math.atan2(L.dx, -L.dz), azR: Math.atan2(R.dx, -R.dz), dL:L.d, dR:R.d };
+}
+
+// ============================================================
+// 하프 제스처 — 화면의 세로 현을 좌우로 "가로지를" 때만 한 음씩 낸다.
+// C2~G5 다이아토닉 26현을 기준으로, 연주 음역은 반옥타브(6반음) 위로 옮긴다.
+// 왼쪽은 저음, 오른쪽은 고음. y 좌표는 음높이·발음에 쓰지 않는다.
+// ============================================================
+const HARP_NOTES=[36,38,40,41,43,45,47,48,50,52,53,55,57,59,60,62,64,65,67,69,71,72,74,76,77,79];
+const HARP_TRANSPOSE=0;
+const HARP_MIN_VX=170;       // px/s, 손 떨림/정지 중 현 경계 왕복 방지
+const HARP_FULL_VX=1450;     // px/s, 이 이상은 가장 강한 플럭으로 포화
+const HARP_DIR_RATIO=1.55;   // |vx|가 |vy|보다 이만큼 커야만 플럭
+const HARP_RETRIGGER_MS=42;  // 같은 현을 추적 노이즈로 즉시 재발음하지 않음
+const HARP_ARM_MS=220;       // 새 손/추적 복구 뒤 위치를 안정화하는 무음 구간
+const HARP_FINGERS=[1,2,3]; // 검지·중지·약지. 엄지·새끼손가락은 하프 플럭에서 제외.
+function harpIndex(x){
+  return Math.max(0, Math.min(HARP_NOTES.length-1, Math.floor((x/Math.max(1,canvas.width))*HARP_NOTES.length)));
+}
+function updateHarpGesture(which, F, tips, dt, pose){
+  // 손가락 평균은 서로 반대 방향으로 움직이는 두 손가락을 상쇄한다.
+  // 따라서 네 손가락 끝을 각각 작은 독립 연주자로 취급한다.
+  const previous=F.harpTips;
+  // tip 랜드마크는 손바닥 중심보다 흔들리므로, 플럭 판정용으로만 가볍게 평활화한다.
+  const current=tips.map((t,i)=>{
+    const p=previous?.[i];
+    return p ? {x:p.x+(t.x-p.x)*0.55, y:p.y+(t.y-p.y)*0.55} : {x:t.x,y:t.y};
+  });
+  const now=performance.now();
+  F.harpTips=current;
+  if(!previous){
+    // 손이 화면에 새로 등장한 첫 위치는 플럭으로 해석하지 않는다.
+    F.harpLast=null; F.harpVelocityEma=null; F.harpArmUntil=now+HARP_ARM_MS;
+    return;
+  }
+  // 추적이 끊겼다가 다른 위치에서 복구되면 여러 현을 한 프레임에 가로지른 것처럼 보인다.
+  // 화면 폭의 30%를 넘는 점프는 재등장으로 간주해 다시 무음으로 arm한다.
+  let maxJump=0;
+  for(const finger of HARP_FINGERS){
+    const old=previous[finger], raw=tips[finger];
+    if(old&&raw) maxJump=Math.max(maxJump,Math.hypot(raw.x-old.x,raw.y-old.y));
+  }
+  if(dt>0.12 || maxJump>canvas.width*0.30){
+    F.harpLast=null; F.harpVelocityEma=null; F.harpArmUntil=now+HARP_ARM_MS;
+    return;
+  }
+  if(now<(F.harpArmUntil||0)) return;
+  const sensitivity=+harpSensEl.value;
+  const h=hand[which]; if(!h?.node) return;
+  for(const finger of HARP_FINGERS){
+    const old=previous[finger], cur=current[finger];
+    if(!old || !cur) continue;
+    const vx=(cur.x-old.x)/dt, vy=(cur.y-old.y)/dt;
+    // 손끝 추적의 순간 튐이 음색을 바꾸지 않도록 수평 속도만 EMA로 안정화한다.
+    // 이 상태 배열은 손마다 한 번만 만들어져 프레임마다 GC를 만들지 않는다.
+    if(!F.harpVelocityEma) F.harpVelocityEma=Array(5).fill(0);
+    const alpha=1-Math.exp(-Math.max(0.001,Math.min(0.080,dt))/0.045);
+    const smoothVX=F.harpVelocityEma[finger]+(Math.abs(vx)-F.harpVelocityEma[finger])*alpha;
+    F.harpVelocityEma[finger]=smoothVX;
+    const threshold=HARP_MIN_VX/sensitivity;
+    if(Math.abs(vx)<threshold || Math.abs(vx)<Math.abs(vy)*HARP_DIR_RATIO) continue;
+    const a=harpIndex(old.x), b=harpIndex(cur.x);
+    if(a===b) continue;
+    const direction=b>a ? 1 : -1;
+    const count=Math.min(8, Math.abs(b-a));
+    // MediaPipe 손가락 번호(검지=1, 중지=2, 약지=3)를 그대로 키로 쓰므로
+    // 0~4 전체 슬롯을 만든다. 엄지/새끼는 비어 있어도 플럭 루프에 들어오지 않는다.
+    if(!F.harpLast) F.harpLast=Array.from({length:5},()=>Array(HARP_NOTES.length).fill(-Infinity));
+    for(let n=1;n<=count;n++){
+      const index=a+direction*n;
+      if(index<0 || index>=HARP_NOTES.length) continue;
+      if(now-F.harpLast[finger][index]<HARP_RETRIGGER_MS) continue;
+      F.harpLast[finger][index]=now;
+      // EMA 속도를 gamma 곡선으로 excitation에 매핑한다. 작은 움직임은 거의 반응하지 않고,
+      // 이 하나의 값이 샘플 재생의 ADSR·밝기·트랜지언트·tilt·압축·미세피치를 모두 구동한다.
+      const speed01=Math.max(0, Math.min(1,
+        (smoothVX-threshold)/Math.max(1,HARP_FULL_VX-threshold)));
+      const excitation=0.036+0.964*Math.pow(speed01,1.75);
+      const delay=(n-1)*0.009;
+      // 고정된 단일 샘플의 음정은 유지하고, excitation만 음향 파라미터를 바꾼다.
+      const note=HARP_NOTES[index]+HARP_TRANSPOSE;
+      if(!playHarpSample(which, note, excitation, delay, pose)){
+        h.node.port.postMessage({type:'pluck', note, velocity:excitation,
+                                 bright:0.68, sustain:+harpSustainEl.value, delay});
+      }
+      F.harpFlash={index, until:now+160};
+    }
+  }
+}
+
+// onResults: MediaPipe 추론이 끝나는 "즉시" 속도 계산 + 소리 업데이트 (rAF 안 기다림 = 저지연)
+function onResults(res){
+  const now=performance.now();
+  const dt=Math.max((now-resT)/1000, 1/240); resT=now;
+  const out=[];
+  const seen={Left:false, Right:false};
+
+  if(res.multiHandLandmarks && res.multiHandedness){
+    res.multiHandLandmarks.forEach((lm, i)=>{
+      const classification=res.multiHandedness[i];
+      if(!classification) return;
+      const raw = classification.label;               // 'Left'/'Right' (비거울)
+      const label = raw==='Left' ? 'Right' : 'Left';  // 거울 보정
+      const F=filters[label];
+      // Hands 결과에서 노출되는 손별 score를 측정 신뢰도 프록시로 사용한다.
+      // 새 손은 슬라이더 임계값을 그대로 사용하되, 이미 추적 중인 손에는 더 낮은
+      // 유지 임계값을 적용한다. 빠른 손에서 score가 잠깐 내려가도 트랙이 꺼졌다
+      // 켜지는 현상을 막는 acquisition/retention hysteresis다.
+      const score=Number(classification.score);
+      const confidence=Number.isFinite(score) ? score : 1;
+      const coreValid=lm && [0,5,9,17].every(index=>
+        Number.isFinite(lm[index]?.x) && Number.isFinite(lm[index]?.y) && Number.isFinite(lm[index]?.z));
+      const acquireThreshold=+handConfEl.value;
+      const trackingRecently=F.lastGoodAt>0 && now-F.lastGoodAt<=HAND_DROPOUT_GRACE_MS;
+      const retainThreshold=Math.max(0.35,acquireThreshold-0.25);
+      if(!coreValid || confidence<(trackingRecently?retainThreshold:acquireThreshold)) return;
+      const cx = (1-(lm[0].x+lm[9].x)/2)*canvas.width;
+      const cy = ((lm[0].y+lm[9].y)/2)*canvas.height;
+      const tips = [4,8,12,16,20].map(id=>({ x:(1-lm[id].x)*canvas.width, y:lm[id].y*canvas.height }));
+      // 손 크기(깊이 추정용): 손목(0)~중지끝(12) 거리 = 카메라와의 거리 지표
+      const handSize = Math.hypot((lm[12].x-lm[0].x)*canvas.width, (lm[12].y-lm[0].y)*canvas.height);
+      seen[label]=true;
+
+      F.confidence=confidence;
+      const sx=F.fx.filter(cx, now), sy=F.fy.filter(cy, now);
+      // 누락 뒤 첫 정상 프레임에서는 전역 프레임 dt가 아니라 마지막 정상 측정부터의
+      // 실제 경과시간을 쓴다. 여러 프레임의 이동량을 한 프레임 dt로 나눠 생기는
+      // 가짜 속도 피크와 갑작스러운 고음/굉음을 방지한다.
+      const handDt=F.lastGoodAt>0
+        ? Math.max(1/240,Math.min(0.22,(now-F.lastGoodAt)/1000))
+        : dt;
+      let palmSpeed=0, windVX=0, windVY=0;
+      if(F.px!=null){
+        const dx=sx-F.px, dy=sy-F.py;
+        palmSpeed=Math.hypot(dx,dy)/handDt;
+        // 화면 크기에 독립적인 초당 화면 비율. 바람의 접선 상대속도에 사용한다.
+        windVX=dx/Math.max(1,canvas.width)/handDt;
+        windVY=dy/Math.max(1,canvas.height)/handDt;
+      }
+      F.px=sx; F.py=sy;
+      F.windVX=F.windVX*0.72+windVX*0.28;
+      F.windVY=F.windVY*0.72+windVY*0.28;
+
+      let fingerSpeed=0;
+      if(F.tipsPrev){
+        let sum=0;
+        for(let k=0;k<tips.length;k++) sum+=Math.hypot(tips[k].x-F.tipsPrev[k].x, tips[k].y-F.tipsPrev[k].y);
+        fingerSpeed=(sum/tips.length)/handDt;
+      }
+      F.tipsPrev=tips.map(t=>({x:t.x,y:t.y}));
+
+      F.speed = palmSpeed + fingerSpeed*(+fingerEl.value);
+      const s=Math.max(0,(F.speed-DEADZONE))/(FULLSPEED-DEADZONE);
+      // 물·바람은 작은 움직임도 잘 반응하게 0.55 감마를 유지한다.
+      // 연필은 속도를 선형으로 보존해야 저속의 작은 소리와 고속의 높은 음이 분리된다.
+      const driveGamma=timbre==='bark-friction' ? 1.00 : 0.55;
+      F.drive=Math.min(1,Math.pow(Math.max(0,s),driveGamma)*(+sensEl.value));
+      // 패닝은 "손이 실제로 얼굴 기준 어디에 있나"로 결정 (좌/우손 정체성 아님).
+      // 오른손이 왼쪽 귀로 가면 왼쪽에서 들림. 얼굴 중심 대비 수평 오프셋(얼굴폭 단위).
+      let panPos;
+      if(face.x!=null && face.size){
+        panPos = (cx - face.x) / (face.size*2.2);       // 음수=왼쪽 귀쪽, 양수=오른쪽 귀쪽
+      } else {
+        panPos = (cx/canvas.width-0.5)*1.4;             // 얼굴 미검출 폴백: 화면 중앙 기준
+      }
+      // 손-얼굴 3D 거리 → dist01 (0=가까움, 1=멀리). 손·얼굴 크기로 깊이까지 추정.
+      const vec = handFaceVec(cx, cy, handSize);
+      const dist01 = vec.dist01;
+      // 손목·검지 MCP·새끼 MCP가 만드는 법선으로 손바닥이 얼굴(카메라)을 향하는 정도를 얻는다.
+      // 손의 좌우 라벨에 따라 법선 부호를 맞춘 뒤, 급격한 뒤집힘은 완만하게 흡수한다.
+      const palmPose=palmPoseFromLandmarks(lm,label);
+      F.palmFacing = F.palmFacing==null ? palmPose.facing : F.palmFacing*0.78 + palmPose.facing*0.22;
+      F.windArea=F.windArea==null ? palmPose.area : F.windArea*0.82+palmPose.area*0.18;
+      F.windSpread=F.windSpread==null ? palmPose.spread : F.windSpread*0.78+palmPose.spread*0.22;
+      F.windCup=F.windCup==null ? palmPose.cup : F.windCup*0.82+palmPose.cup*0.18;
+      // === B. 접근 속도 (도플러용) ===
+      //  머리까지의 실제 거리(m)를 미분 → 다가오면 +, 멀어지면 - (m/s).
+      //  MediaPipe 깊이 추정은 노이즈가 크므로 강하게 평활화한다.
+      let vClose = 0;
+      if(F.prevDistM!=null){
+        const raw = (F.prevDistM - vec.distM)/handDt;      // 가까워지면 양수
+        if(isFinite(raw) && Math.abs(raw)<6){              // 추적 튐 리젝트
+          F.vClose = (F.vClose||0)*0.75 + raw*0.25;        // 저역통과
+        }
+      }
+      F.prevDistM = vec.distM;
+      vClose = F.vClose||0;
+      const tangentSpeed=Math.hypot(F.windVX,F.windVY);
+      const directionChange=Math.hypot(F.windVX-F.windPrevVX,F.windVY-F.windPrevVY);
+      F.windPrevVX=F.windVX; F.windPrevVY=F.windVY;
+      const motionRaw=Math.min(1,tangentSpeed*1.15+directionChange*0.35+F.drive*0.35);
+      // 빠르게 반응하고 천천히 가라앉혀, 방향 전환의 돌풍은 살리되 추적 떨림은 숨긴다.
+      const motionAlpha=motionRaw>F.windMotion?0.62:0.075;
+      F.windMotion+= (motionRaw-F.windMotion)*motionAlpha;
+      // 카메라→사용자 방향의 기본 풍속 0.45. 얼굴 쪽으로 따라가면 상대풍속↓,
+      // 카메라 쪽으로 거슬러 움직이면↑. 좌우·상하 움직임은 접선 난류를 더한다.
+      F.windRelative=Math.max(0.18,Math.min(1.35,
+        0.45-Math.max(-2,Math.min(2,vClose))*0.12+tangentSpeed*0.70));
+      F.dist=dist01; F.vec=vec;
+      const palmState={
+        facing:F.palmFacing, area:F.windArea, spread:F.windSpread, cup:F.windCup,
+        motion:F.windMotion, relativeFlow:F.windRelative,
+      };
+      setHand(label, F.drive, panPos, dist01, true, false, vec, vClose, palmState);   // ← 즉시 소리 반영
+      // 하프 플럭은 여기서 발생시켜, 플럭 순간의 거리·좌우 위치를 독립 보이스에 고정한다.
+      if(timbre==='harp-strings') updateHarpGesture(label, F, tips, handDt, {panPos,dist01});
+      else { F.harpTips=null; F.harpLast=null; F.harpVelocityEma=null; F.harpArmUntil=0; F.harpFlash=null; }
+
+      const visualDrive=timbre==='wind-flow'
+        ? Math.min(1,0.16+(F.windArea||0)*0.34+(F.windMotion||0)*0.50) : F.drive;
+      const visual={label, cx, cy, tips, lm, drive:visualDrive, dist:dist01,
+                    palmFacing:F.palmFacing, windArea:F.windArea, windMotion:F.windMotion, confidence};
+      out.push(visual);
+      F.lastGoodAt=now;
+      F.lastStableDrive=F.drive;
+      F.lastPanPos=panPos; F.lastDist01=dist01; F.lastVec=vec; F.lastPalm=palmState;
+      F.lastVisual=visual;
+    });
+  }
+  // 짧은 검출 누락은 마지막 위치에서 자연스럽게 감쇠시키며 이어 준다.
+  // grace를 넘겨 실제로 손이 사라졌을 때만 추적 이력을 초기화하고 배경으로 전환한다.
+  for(const w of ['Left','Right']){
+    if(!seen[w]){
+      const F=filters[w];
+      const missingMs=F.lastGoodAt>0 ? now-F.lastGoodAt : Infinity;
+      if(missingMs<=HAND_DROPOUT_GRACE_MS && F.lastVec && F.lastPalm){
+        // 첫 70ms(대개 1~2프레임)는 그대로 유지한 뒤 약 260ms 시정수로 감쇠한다.
+        // 따라서 짧은 누락은 들리지 않지만 실제 손 퇴장은 길게 끌리지 않는다.
+        const heldDrive=F.lastStableDrive*Math.exp(-Math.max(0,missingMs-70)/260);
+        F.drive=heldDrive;
+        setHand(w,heldDrive,F.lastPanPos,F.lastDist01,true,false,F.lastVec,0,F.lastPalm);
+        if(F.lastVisual) out.push({...F.lastVisual,drive:heldDrive,confidence:null});
+        continue;
+      }
+      F.px=F.py=null; F.tipsPrev=null; F.palmFacing=null;
+      F.confidence=null; F.prevDistM=null; F.vClose=0;
+      F.windVX=F.windVY=F.windPrevVX=F.windPrevVY=0;
+      F.windMotion=0; F.windArea=F.windSpread=F.windCup=null;
+      F.windRelative=0.45;
+      F.harpTips=null; F.harpLast=null; F.harpVelocityEma=null; F.harpArmUntil=0; F.harpFlash=null;
+      F.speed=0; F.drive=0; F.lastGoodAt=0; F.lastStableDrive=0;
+      F.lastVec=null; F.lastPalm=null; F.lastVisual=null;
+      setHand(w, 0, 0, 0, true, true); }   // 배경모드(bg=true): 거리감쇠 없이 정면·풀볼륨
+  }
+  // 고정 바다 배경이 손 상호작용의 거리 필터를 가리지 않도록, 실제 물소리가
+  // 발생하는 동안에만 별도 게인을 최대 34% 덕킹한다. 먼 손은 직접음이 작으므로
+  // 아주 조금 더 덕킹해 음색 비교가 가능하게 한다.
+  if(oceanDuckGain&&ctx){
+    let prominence=0;
+    if(timbre==='water-drops'){
+      for(const H of out){
+        const drive=Math.max(0,Math.min(1,H.drive||0));
+        const dist=Math.max(0,Math.min(1,H.dist||0));
+        prominence=Math.max(prominence,drive*(0.75+dist*0.25));
+      }
+    }
+    const duck=1-0.34*Math.pow(prominence,0.70);
+    oceanDuckGain.gain.setTargetAtTime(duck,ctx.currentTime,0.12);
+  }
+  latest=out;
+}
+
+// B. 헤드 트래킹 적용: 평활화된 yaw로 리스너 정면 벡터를 회전.
+//  머리를 돌리면 손 소리가 반대로 움직임(parallax) → 외재화↑.
+function updateListenerOrientation(){
+  if(!audioReady || !ctx) return;
+  const target=(face.x!=null)?face.yaw:0;
+  yawSmooth += 0.15*(target - yawSmooth);
+  pitchSmooth += 0.15*(((face.x!=null)?face.pitch:0) - pitchSmooth);
+  rollSmooth  += 0.15*(((face.x!=null)?face.roll :0) - rollSmooth);
+  const fx=Math.sin(yawSmooth), fz=-Math.cos(yawSmooth);
+  const L=ctx.listener, now=ctx.currentTime;
+  if(L.forwardX){ L.forwardX.setTargetAtTime(fx,now,0.05); L.forwardZ.setTargetAtTime(fz,now,0.05); }
+  else if(L.setOrientation){ L.setOrientation(fx,0,fz, 0,1,0); }
+  // §14 확장 리스너: yaw/pitch/roll 전부 반영. 회전하면 "공간"이 아니라
+  //  "소스 방향"이 리스너 기준으로 다시 계산된다(worldToLocal).
+  if(spatialListener){
+    // SpatialListener는 Three.js식 +yaw=왼쪽, AudioListener는 여기서 +yaw=오른쪽으로 쓴다.
+    // 부호를 뒤집어 네이티브 Panner와 측정 HRTF/수동 ITD가 같은 방향으로 움직이게 한다.
+    spatialListener.rotation.set(-yawSmooth, pitchSmooth, rollSmooth);
+    spatialListener.updateMatrix();
+  }
+}
+// loop: 그리기 전용 (소리는 onResults에서 이미 처리)
+let _blackout=0, _loopPrev=0;   // 현재 블랙아웃 불투명도, 이전 프레임 시각
+function loop(now){
+  gtx.clearRect(0,0,canvas.width,canvas.height);
+  if(timbre==='harp-strings') drawHarpStrings(now);
+  updateListenerOrientation();
+  voiceManager.update();   // §10 우선순위 재계산 → 등급 배정
+
+  // === 눈 감김 → 2초에 걸쳐 블랙아웃 (뜨면 2초에 걸쳐 복귀) ===
+  //  프레임 시간(dt) 기반으로 목표(감음=1, 뜸=0)를 향해 1/2초당 진행 → 정확히 2초 전환.
+  const dt = _loopPrev ? Math.min((now-_loopPrev)/1000, 0.1) : 0; _loopPrev=now;
+  const targetB = eyesClosed ? 1 : 0;
+  const step = dt/2.0;                        // 2초에 0→1
+  if(_blackout < targetB) _blackout = Math.min(targetB, _blackout+step);
+  else if(_blackout > targetB) _blackout = Math.max(targetB, _blackout-step);
+  faceMeshEl.style.opacity = _blackout.toFixed(3);
+
+  const seen={Left:false, Right:false};
+
+  // 얼굴 마커 + 손→얼굴 거리선
+  if(face.x!=null){
+    gtx.beginPath(); gtx.arc(face.x, face.y, Math.max(14,(face.size||60)*0.35), 0, Math.PI*2);
+    gtx.strokeStyle='rgba(0,0,0,.25)'; gtx.lineWidth=2; gtx.stroke();
+    gtx.fillStyle='rgba(0,0,0,.35)'; gtx.font='11px sans-serif'; gtx.fillText('얼굴', face.x-12, face.y-Math.max(14,(face.size||60)*0.35)-6);
+    for(const h of latest){
+      gtx.beginPath(); gtx.moveTo(face.x,face.y); gtx.lineTo(h.cx,h.cy);
+      const near=1-(h.dist||0);
+      gtx.strokeStyle=`rgba(56,189,248,${0.15+near*0.5})`; gtx.lineWidth=1+near*3; gtx.stroke();
+    }
+  }
+  for(const h of latest){ seen[h.label]=true; drawHand(h, h.drive||0); }
+
+  const df=(w)=> seen[w] ? (filters[w].dist!=null?(filters[w].dist<0.33?'가까움':filters[w].dist<0.66?'중간':'멀리'):'—') : '—';
+  const yawDeg=(yawSmooth*180/Math.PI).toFixed(0);
+  const dv=(w)=> seen[w]&&filters[w].dist!=null ? filters[w].dist.toFixed(2) : '—';
+  const cf=(w)=> seen[w]&&filters[w].confidence!=null ? ` C${Math.round(filters[w].confidence*100)}` : '';
+  const wf=(w)=>{
+    if(timbre!=='wind-flow'||!seen[w]) return '';
+    const W=hand[w]?.windState;
+    return W ? ` 바람[면${W.area.toFixed(2)} 동${W.motion.toFixed(2)} 흐${W.relativeFlow.toFixed(2)}]` : '';
+  };
+  const waterTone=(w)=>{
+    if(timbre!=='water-drops'||!seen[w]) return '';
+    const T=hand[w]?.waterTone;
+    if(!T) return '';
+    return ` 물[LP${(T.cut/1000).toFixed(1)}k HS${T.shelfDb>=0?'+':''}${T.shelfDb.toFixed(1)}dB 밀${Math.round(T.density*100)}% V${Math.round(T.volume*100)}%]`;
+  };
+  const eye = eyesClosed ? '눈 감음' : `눈 뜸(EAR ${lastEAR.toFixed(2)})`;
+  // head shadow 진단: 귀별 거리(cm)와 좌우 게인비 → 가중치가 눈에 보이게.
+  const hs=(w)=>{
+    const S=hand[w]&&hand[w].shadow; if(!seen[w]||!S) return '';
+    const dB=20*Math.log10(Math.max(1e-3,S.gL)/Math.max(1e-3,S.gR));
+    const h=hand[w];
+    const drr = h.sendEarly ? ` DRR${(20*Math.log10(Math.max(1e-3,h.gain.gain.value)/Math.max(1e-3,h.sendEarly.gain.value))).toFixed(0)}dB` : '';
+    const itd=(S.itdL||S.itdR) ? ` ITD${S.itdL>0?'L':'R'}${Math.round(Math.max(S.itdL,S.itdR)*1e6)}μs` : ' ITD0';
+    const v=filters[w].vClose;
+    const dop=(v&&Math.abs(v)>0.05) ? ` ${v>0?'▲':'▼'}${Math.abs(v).toFixed(2)}m/s` : '';
+    return ` [귀 L${(S.dL*100).toFixed(0)}/R${(S.dR*100).toFixed(0)}cm ${dB>=0?'L':'R'}+${Math.abs(dB).toFixed(1)}dB${itd}${drr}${dop}]`;
+  };
+  // 확장 엔진 상태: 회전 3축 + 방 + RT60
+  const pDeg=(pitchSmooth*180/Math.PI).toFixed(0), rDeg=(rollSmooth*180/Math.PI).toFixed(0);
+  const eng = engineOnEl.checked && currentRoom
+    ? ` · 방 ${currentRoom.w.toFixed(1)}×${currentRoom.h.toFixed(1)}×${currentRoom.d.toFixed(1)}m RT60 ${currentRT60.toFixed(2)}s`
+    : ' · 엔진OFF';
+  statusEl.textContent = `얼굴 ${face.x!=null?'O':'X'} · ${eye} · 머리 Y${yawDeg}°P${pDeg}°R${rDeg}°${eng} · 왼손 ${df('Left')}(${dv('Left')})${cf('Left')}${hs('Left')}${wf('Left')}${waterTone('Left')} · 오른손 ${df('Right')}(${dv('Right')})${cf('Right')}${hs('Right')}${wf('Right')}${waterTone('Right')}`;
+  requestAnimationFrame(loop);
+}
+
+function drawHarpStrings(now){
+  const top=122, bottom=canvas.height-34;
+  const w=canvas.width/HARP_NOTES.length;
+  gtx.save();
+  for(let i=0;i<HARP_NOTES.length;i++){
+    const x=(i+0.5)*w;
+    let flash=0;
+    for(const side of ['Left','Right']){
+      const f=filters[side].harpFlash;
+      if(f?.index===i) flash=Math.max(flash, Math.max(0,(f.until-now)/160));
+    }
+    const c=(HARP_NOTES[i]%12===0 || HARP_NOTES[i]%12===5) ? '224,72,72' : '199,157,76';
+    gtx.beginPath(); gtx.moveTo(x,top); gtx.lineTo(x,bottom);
+    gtx.strokeStyle=`rgba(${c},${0.18+flash*0.78})`;
+    gtx.lineWidth=1+flash*4; gtx.stroke();
+  }
+  gtx.fillStyle='rgba(116,83,32,.62)'; gtx.font='11px sans-serif';
+  gtx.fillText('← 저음     좌우로 현을 가로질러 연주     고음 →', 18, canvas.height-14);
+  gtx.restore();
+}
+
+function drawHand(h, drive){
+  const lm=h.lm;
+  // 손 골격 (연한 회색)
+  const P=(i)=>({x:(1-lm[i].x)*canvas.width, y:lm[i].y*canvas.height});
+  const bones=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+  gtx.strokeStyle='rgba(0,0,0,.18)'; gtx.lineWidth=2;
+  for(const [a,b] of bones){ const pa=P(a),pb=P(b); gtx.beginPath(); gtx.moveTo(pa.x,pa.y); gtx.lineTo(pb.x,pb.y); gtx.stroke(); }
+  // 손바닥 중심 = 소리 나는 지점. drive에 따라 커지고 진해짐
+  const col = h.label==='Left' ? '99,102,241' : '244,63,94';   // 왼=보라, 오른=빨강
+  const r=10+drive*22;
+  gtx.beginPath(); gtx.arc(h.cx,h.cy,r,0,Math.PI*2);
+  gtx.fillStyle=`rgba(${col},${0.15+drive*0.5})`; gtx.fill();
+  gtx.lineWidth=2.5; gtx.strokeStyle=`rgba(${col},.9)`; gtx.stroke();
+}
+</script>

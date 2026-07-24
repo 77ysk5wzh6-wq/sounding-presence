@@ -1,0 +1,1620 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sounding Presence — Visual Scenes</title>
+<link rel="icon" href="data:,">
+<!--
+  presence_glass presentation — 교수님 전달·배포용 인터페이스.
+  내부 튜닝 파라미터는 보존하되 화면에는 시작·장면 전환 버튼만 노출한다.
+  원본: presence_glass.html
+  ----------------------------------------------------------------
+  기반: Shadertoy 레이마칭 박스(사용자 제공). 고정 스텝으로 SDF 박스를 누적하는
+        볼류메트릭 렌더 + cos 팔레트 색상. 텍스처/멀티버퍼 없이 자체완결.
+  개조:
+    · 자전(iTime) → 마우스 이동량 누적(uSpin). 움직인 방향으로 도형이 돌고,
+      멈추면 관성으로 서서히 감속(+아주 느린 기본 자전).
+    · 팔레트 시간 항 → uHue(마우스 이동량 누적). 회전이 빠를수록 색이 빨리 흐른다.
+    · 배경 검정 → 흰색. 원본은 premultiplied 누적이라 bg*(1-a) + rgb 로 합성.
+  · 순수 WebGL(라이브러리·인터넷 불필요). 그냥 열어도 됨.
+  · Shadertoy 규약 매핑: iTime→uTime, iResolution→uRes, 회전/색상에 uSpin·uHue 추가.
+-->
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #ffffff; }
+  #gl { display: block; width: 100vw; height: 100vh; }
+  #hint { position: fixed; bottom: 18px; left: 0; right: 0; text-align: center;
+    color: rgba(60,60,90,.45); font: 13px "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
+    letter-spacing: .03em; pointer-events: none; }
+  #status { position: fixed; z-index: 30; bottom: 6px; left: 8px; color: rgba(60,60,90,.5);
+    font: 11px system-ui, sans-serif; font-variant-numeric: tabular-nums; opacity: 0; }
+  /* 카메라 상태 안내 — 손이 잡히면 사라진다 */
+  #camHint { position: fixed; z-index: 55; top: 16px; left: 50%; transform: translateX(-50%);
+    padding: 7px 16px; border-radius: 999px; background: rgba(255,255,255,.8);
+    border: 1px solid rgba(60,60,90,.14); color: rgba(60,60,90,.62);
+    font: 12px system-ui, sans-serif; letter-spacing: .02em; pointer-events: none;
+    transition: opacity .8s ease; }
+  body.handson #camHint { opacity: 0; }
+  body.debug #status { opacity: 1; }
+
+  /* 스텝/경계 실시간 확인용 패널 */
+  #panel { position: fixed; z-index: 40; top: 14px; right: 14px; width: 232px;
+    background: rgba(255,255,255,.82); backdrop-filter: blur(8px);
+    border: 1px solid rgba(60,60,90,.14); border-radius: 10px; padding: 12px 13px 10px;
+    font: 12px system-ui, -apple-system, sans-serif; color: #33334a;
+    box-shadow: 0 4px 18px rgba(40,40,70,.10); user-select: none; }
+  #panel h4 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    color: rgba(60,60,90,.5); margin-bottom: 9px; }
+  #panel label { display: block; margin: 9px 0 2px; display: flex; justify-content: space-between;
+    align-items: baseline; }
+  #panel label span:last-child { font-variant-numeric: tabular-nums; color: rgba(60,60,90,.6);
+    font-size: 11px; }
+  #panel input[type=range] { width: 100%; margin: 0; accent-color: #e2679b; }
+  #panel .row { display: flex; align-items: center; gap: 7px; margin-top: 11px;
+    padding-top: 10px; border-top: 1px solid rgba(60,60,90,.10); }
+  #panel .row input { accent-color: #e2679b; }
+  #panel .note { margin-top: 8px; font-size: 10.5px; line-height: 1.45; color: rgba(60,60,90,.45); }
+  #panel button { margin-top: 9px; width: 100%; padding: 5px; font: 11px system-ui, sans-serif;
+    color: #33334a; background: rgba(60,60,90,.06); border: 1px solid rgba(60,60,90,.14);
+    border-radius: 6px; cursor: pointer; }
+  #panel button:hover { background: rgba(60,60,90,.11); }
+  body.hidepanel #panel { display: none; }
+
+  /* 시작 오버레이 — 누르기 전까지 완전한 구가 회전한다 */
+  #startWrap { position: fixed; inset: 0; z-index: 60; display: flex;
+    align-items: center; justify-content: center; pointer-events: none; }
+  #startBtn { pointer-events: auto; cursor: pointer;
+    padding: 14px 44px; border-radius: 999px;
+    font: 500 15px/1 system-ui, -apple-system, sans-serif; letter-spacing: .12em;
+    color: #33334a; background: rgba(255,255,255,.72); backdrop-filter: blur(10px);
+    border: 1px solid rgba(60,60,90,.18);
+    box-shadow: 0 6px 26px rgba(40,40,70,.10);
+    transition: opacity .6s ease, transform .6s ease, background .2s ease; }
+  #startBtn:hover { background: rgba(255,255,255,.92); }
+  body.started #startWrap { opacity: 0; pointer-events: none;
+    transition: opacity 1s ease; }
+  /* 시작 전에는 패널을 숨긴다 */
+  body:not(.started) #panel { display: none; }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<canvas id="gl"></canvas>
+<video id="cam" playsinline muted style="display:none"></video>
+<div id="status">…</div>
+<div id="camHint">카메라를 허용하면 두 손으로 조작할 수 있습니다</div>
+
+<div id="startWrap"><button id="startBtn">START</button></div>
+
+<div id="panel">
+  <h4>레이마칭</h4>
+
+  <label><span>스텝 수</span><span id="vSteps">37</span></label>
+  <input type="range" id="sSteps" min="10" max="320" step="1" value="37">
+
+  <label><span>경계 두께</span><span id="vEdge">0.19</span></label>
+  <input type="range" id="sEdge" min="0.01" max="2" step="0.01" value="0.19">
+
+  <label><span>밀도</span><span id="vDensity">0.120</span></label>
+  <input type="range" id="sDensity" min="0.01" max="2.5" step="0.005" value="0.12">
+
+  <div class="row">
+    <input type="checkbox" id="cUniform">
+    <label for="cUniform" style="margin:0;display:inline">균일 스텝(또렷)</label>
+  </div>
+
+  <label style="margin-top:11px; padding-top:10px; border-top:1px solid rgba(60,60,90,.10)">
+    <span>큐브 ↔ 구</span><span id="vShape">0.14</span></label>
+  <input type="range" id="sShape" min="0" max="1" step="0.01" value="0.14">
+  <div class="note">0 = 큐브, 1 = 구. 중간값은 모서리가 둥근 형태.</div>
+
+  <label style="margin-top:11px; padding-top:10px; border-top:1px solid rgba(60,60,90,.10)">
+    <span>크기</span><span id="vScale">1.00</span></label>
+  <input type="range" id="sScale" min="0.4" max="4" step="0.05" value="1.0">
+
+  <label><span>가로 늘이기</span><span id="vStretchX">0.85</span></label>
+  <input type="range" id="sStretchX" min="0.3" max="4" step="0.05" value="0.85">
+
+  <label><span>세로 늘이기</span><span id="vStretchY">1.00</span></label>
+  <input type="range" id="sStretchY" min="0.3" max="4" step="0.05" value="1.0">
+
+  <button id="bFill">화면 가득 채우기</button>
+
+  <div style="margin-top:11px; padding-top:10px; border-top:1px solid rgba(60,60,90,.10)"></div>
+  <div id="sceneBtns">
+    <button id="bSceneCube" class="scn">인트로</button>
+    <button id="bSceneEther" class="scn">물</button>
+    <button id="bSceneHarp" class="scn">하프</button>
+  </div>
+
+  <div id="harpCtl">
+  <label><span>판 개수</span><span id="vHarpCount">120</span></label>
+  <input type="range" id="sHarpCount" min="6" max="260" step="1" value="120">
+
+  <label><span>판 두께</span><span id="vHarpThick">1.35</span></label>
+  <input type="range" id="sHarpThick" min="0.2" max="10" step="0.05" value="1.35">
+
+  <label><span>판 폭(간격 대비)</span><span id="vHarpSpread">1.15</span></label>
+  <input type="range" id="sHarpSpread" min="0.2" max="2.5" step="0.05" value="1.15">
+
+  <label><span>마우스 회전 감도</span><span id="vHarpTurn">1.00</span></label>
+  <input type="range" id="sHarpTurn" min="0" max="3" step="0.05" value="1.0">
+  </div>
+  <div class="note">큐브가 2초간 회전 가속하며 사라진 <b>뒤</b> 유기적 도형이 등장합니다
+    (크로스페이드 아님). 다시 누르면 역순.<br>
+    Ether — nimitz, CC BY-NC-SA 3.0.</div>
+
+  <label style="margin-top:11px; padding-top:10px; border-top:1px solid rgba(60,60,90,.10)">
+    <span>색조 이동</span><span id="vHueShift">0°</span></label>
+  <input type="range" id="sHueShift" min="-180" max="180" step="1" value="0">
+  <div class="note">세 씬의 색을 색상환에서 함께 회전합니다(밝기·채도 유지).</div>
+
+  <div class="note">원본은 <b>가변 스텝</b>(뒤로 갈수록 성큼) → 흐릿함.<br>
+    체크하면 균일 스텝 + 스텝 수를 올릴수록 또렷해집니다.</div>
+
+  <label style="display:flex;align-items:center;gap:6px;margin-top:8px">
+    <input type="checkbox" id="cEtherVol" checked>
+    <span>유기체를 큐브 방식으로 렌더</span></label>
+
+  <button id="bReset">원본값으로 되돌리기</button>
+  <div class="note" style="margin-top:6px">P키: 패널 숨기기 · D키: 상태표시</div>
+</div>
+
+<style>
+  /* 하프 씬일 때만 관련 슬라이더를 보여준다(패널이 길어지는 걸 막는다). */
+  #harpCtl{ display:none; }
+  body.harp #harpCtl{ display:block; }
+  /* 씬 전환 버튼: 현재 씬을 강조해서 어디에 있는지 바로 보이게 한다. */
+  #sceneBtns{ display:flex; gap:6px; margin:10px 0 4px; }
+  #sceneBtns .scn{ flex:1; padding:7px 0; }
+  #sceneBtns .scn.on{ outline:2px solid rgba(120,120,255,.85); font-weight:700; }
+</style>
+<style id="presentation-ui">
+  /* 발표용 UI: START 전에는 시작 버튼만, 시작 후에는 장면 버튼만 표시한다. */
+  #status, #camHint, #hint { display: none !important; }
+  #panel {
+    top: 14px; left: 50%; right: auto; width: auto;
+    transform: translateX(-50%);
+    padding: 8px; border-radius: 12px;
+  }
+  #panel > * { display: none !important; }
+  #panel #sceneBtns {
+    display: flex !important; gap: 7px; margin: 0;
+  }
+  #sceneBtns .scn {
+    min-width: 82px; padding: 9px 16px;
+    white-space: nowrap; border-radius: 8px;
+  }
+  body:not(.started) #panel { display: none !important; }
+  body.started #panel,
+  body.started.hidepanel #panel { display: block !important; }
+  @media (max-width: 420px) {
+    #sceneBtns .scn { min-width: 0; padding: 8px 12px; }
+  }
+</style>
+<script id="vert" type="x-shader/x-vertex">
+attribute vec2 pos;
+void main(){ gl_Position = vec4(pos, 0.0, 1.0); }
+</script>
+
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2  uRes;      // iResolution
+uniform float uTime;     // iTime
+uniform vec2  uSpin;     // 마우스가 누적한 회전각(x=yaw, y=pitch) — 도형 회전
+uniform float uHue;      // 색 위상(마우스 이동량 누적)
+uniform float uSteps;    // march 스텝 수 (많을수록 또렷)
+uniform float uStepMode; // 0 = 원본 가변 스텝(흐림), 1 = 균일 스텝(또렷)
+uniform float uEdge;     // smoothstep 폭 (작을수록 경계 또렷)
+uniform float uDensity;  // 스텝당 밀도 기여
+uniform float uShape;    // 0 = 큐브, 1 = 구
+uniform float uScale;    // 도형 크기(화면을 채우는 정도)
+uniform vec2  uStretch;  // 가로/세로 늘이기 배수
+uniform float uEther;    // 0 = 큐브/구, 1 = Ether(유기적 도형)
+uniform vec2  uMouse;    // 마우스 위치(셰이더 좌표, 화면 중앙 = 0,0)
+uniform float uHueShift; // 팔레트 색조 회전(라디안). 0 = 원본 색. 세 씬 모두 적용
+uniform float uCubeFade; // 큐브 남은 정도. 1 = 그대로, 0 = 완전히 사라짐
+uniform float uWrithe;   // 유기적 도형 퇴장 시 꿈틀거림 세기. 0 = 없음
+uniform float uEtherZoom;// 유기적 도형 배율. 1 = 기본(70%), 클수록 크게
+uniform float uHarp;     // 하프 씬 정도. 0 = 큐브/구, 1 = 하프(판 배열)
+uniform float uHarpCount;// 화면을 가로지르는 판 개수
+uniform float uHarpTurn; // 판이 Z축으로 도는 각도(마우스가 밀어준다)
+uniform float uHarpThick;// 판 두께 배수(1 = 기본)
+uniform float uHarpSpread;// 판 사이 간격 대비 판 폭(1 = 빽빽)
+uniform vec2  uHarpPull;  // x = 인력 중심 1(왼손/마우스), y = 세기 0~1
+uniform vec2  uHarpPull2; // x = 인력 중심 2(오른손), y = 세기 0~1. 마우스일 땐 세기 0
+uniform float uHarpZoom;  // 하프 전환용 확대(1 = 기본, 클수록 중앙으로 확대)
+uniform float uHarpSpin;  // 하프 전환용 추가 회전(라디안)
+uniform float uHarpGap;   // 판 간격 벌어짐(1 = 기본, 클수록 서로 멀어짐)
+uniform float uHarpFade;  // 하프 남은 정도(1 = 그대로, 0 = 완전히 사라짐)
+uniform float uEtherStyle;// 유기체 렌더 방식. 0 = 원본(발광), 1 = 볼류메트릭(큐브와 같은 미학)
+uniform float uBlueTint; // 인트로 파랑 틴트. 1 = 완전 파랑, 0 = 팔레트 원색
+uniform vec2  uGlow;     // 유기체 글로우 중심(왼손). 마우스 폴백 시 uMouse와 같다
+#define iTime  uTime
+#define iResolution uRes
+
+//  팔레트 주파수는 고정한다. 이 값을 애니메이션하면 같은 깊이의 색이
+//  색상환을 계속 훑어 무지개가 스쳐 지나간다(인트로→큐브 이행이 정신없어지는 원인).
+const float PAL_FREQ = 30.234;
+//  인트로 구의 색. 착지하며 이 색에서 팔레트 원색으로 빠져나간다.
+const vec3 INTRO_BLUE = vec3(0.33, 0.54, 1.0);
+
+mat2 rot(float a){
+  float s = sin(a), c = cos(a);
+  return mat2(c,-s,s,c);
+}
+#define m2 rot        // Ether 원본의 m() 과 동일
+
+float box(vec3 p, vec3 b){
+  vec3 q = abs(p) - b;
+  return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);
+}
+float sphere(vec3 p, float r){
+  return length(p) - r;
+}
+
+// [최적화] 회전행렬·스케일은 픽셀 안에서 상수인데 매 스텝 다시 계산하면 낭비다.
+//  main()에서 한 번 만들어 전역에 담고, cyl()은 그걸 읽기만 한다.
+//  (sin/cos 4회 + 나눗셈 3회 × 스텝수 만큼 절약)
+mat2 gRotXZ, gRotXY;
+vec3 gInvScale;      // 1/s 를 미리 계산(나눗셈 → 곱셈)
+float gScaleFix;     // min(s) 보정값
+
+void setupShape(){
+  //  uSpin.x/y 에 퇴장 회전(uExitSpin)이 이미 더해져 들어온다(JS에서 누적).
+  gRotXZ = rot(uSpin.x);
+  gRotXY = rot(uSpin.y);
+  vec3 s = vec3(uStretch, 1.0) * uScale;
+  gInvScale = 1.0 / s;
+  gScaleFix = min(min(s.x, s.y), s.z);
+}
+
+
+
+// 팔레트. 원본(파랑~노랑 계열)에 주황~핑크 계열을 섞는다.
+//  IQ 코사인 팔레트: 0.5+0.5*cos(phase + a*freq). phase 3개가 어떤 색이 나올지 결정.
+//
+//  [어두워짐 vs 채도] 밝기를 올리려고 base를 올리고 amp를 줄이면
+//  세 채널이 서로 가까워져서 = 회색으로 빠진다(채도 손실). 둘은 별개 문제이므로
+//  진폭은 그대로 크게 두고(=채도 유지), 밝기만 따로 정규화한다(아래 normalize()).
+
+// 가장 밝은 채널을 1.0까지 끌어올린다. 채널 간 "비율"은 그대로라 색상·채도가 보존되고
+//  전체가 어두웠던 색만 밝아진다. (HSV의 V만 올리는 것과 같은 효과)
+vec3 normalizeBright(vec3 c){
+  float m = max(max(c.r, c.g), c.b);
+  return c / max(m, 1e-4);
+}
+// 위 결과는 항상 어느 한 채널이 1.0이라 너무 쨍하다. 흰색과 살짝 섞어 파스텔로.
+//  단 이 혼합은 채도를 균일하게 낮추므로 회색으로 빠지는 구간이 생기지 않는다.
+vec3 pastel(vec3 c, float k){
+  return mix(c, vec3(1.0), k);
+}
+
+// 색조만 회전시킨다(밝기·채도는 유지). YIQ 색공간에서 I-Q 평면을 돌리는 방식.
+//  RGB를 직접 섞으면 밝기가 출렁이는데, 휘도(Y)를 축으로 두면 그게 안 생긴다.
+vec3 hueRotate(vec3 c, float a){
+  if(abs(a) < 0.001) return c;
+  float s = sin(a), co = cos(a);
+  //  RGB → YIQ
+  float y = dot(c, vec3(0.299, 0.587, 0.114));
+  float i = dot(c, vec3(0.596, -0.274, -0.322));
+  float q = dot(c, vec3(0.211, -0.523, 0.312));
+  //  I-Q 평면 회전 = 색상 회전
+  float i2 = i*co - q*s;
+  float q2 = i*s + q*co;
+  //  YIQ → RGB
+  return vec3(y + 0.956*i2 + 0.621*q2,
+              y - 0.272*i2 - 0.647*q2,
+              y - 1.106*i2 + 1.703*q2);
+}
+
+
+
+
+vec3 palCool(float a){                      // 파랑~시안~노랑 (원본 진폭 그대로)
+  vec3 c = 0.5 + 0.5*cos(vec3(1.,2.,4.)/2. + a*PAL_FREQ + uHue);
+  return pastel(normalizeBright(c), 0.14);
+}
+vec3 palWarm(float a){                      // 주황 ↔ 분홍
+  //  난류는 "주황~분홍"이어야 한다. G를 크게 올리면 노랑이 절반을 넘어가
+  //  전혀 다른 인상이 되므로(시도해 봄), 원래 성격을 유지하되 분홍만 조금 줄인다.
+  //   분포: 주황 42% / 분홍 39% / 빨강 19%, 노랑 0%.
+  //  진폭을 키워도 normalizeBright가 밝기를 잡아주므로 탁해지지 않는다.
+  float t = a*PAL_FREQ*0.5 + uHue*0.25;
+  vec3 amp = vec3(0.08, 0.24, 0.40);
+  vec3 base= vec3(0.92, 0.52, 0.50);
+  vec3 c = clamp(base + amp*cos(6.28318*(t*0.55 + vec3(0.0, 0.08, 0.42))), 0.0, 1.0);
+  return pastel(normalizeBright(c), 0.12);
+}
+// [최적화] 한류/난류 혼합비와 채도 보정량은 uHue만으로 정해져 픽셀 내내 상수다.
+//  매 스텝 sin/smoothstep을 다시 돌 필요가 없어 main()에서 한 번만 구한다.
+float gMix, gDip;
+void setupPalette(){
+  // 두 계열을 아주 느리게 오간다(uHue 기준) → 회전하며 한류/난류가 번갈아 온다.
+  //  [주의] 한류(파랑)와 난류(주황)는 색상환에서 거의 반대라, 50:50으로 섞으면
+  //  서로 상쇄돼 회색이 된다. smoothstep으로 전이 구간을 좁혀
+  //  대부분의 시간을 "완전한 한류" 또는 "완전한 난류"로 보내고 중간은 빠르게 지난다.
+  float s = 0.5 + 0.5*sin(uHue * 0.23);
+  gMix = smoothstep(0.35, 0.65, s);
+  gDip = 1.0 - abs(gMix - 0.5)*2.0;                // 0(양끝) ~ 1(한가운데)
+}
+
+vec3 pal(float a){
+  //  [색조 이동] 슬라이더(uHueShift)를 팔레트 출력에 적용한다.
+  //   [주의] 예전에는 Ether 발광 렌더러 안에서만 돌렸는데, 볼류메트릭 모드가
+  //   그 앞에서 return 해버려 슬라이더가 아무 효과도 없었다. 여기서 돌리면
+  //   큐브·하프·유기체가 모두 같은 규칙으로 색조가 이동한다.
+  //  [최적화] 한쪽 끝에 붙어 있을 때는 반대편 팔레트를 계산할 필요가 없다.
+  //  대부분의 시간을 양 끝에서 보내므로(위 smoothstep) 실제로 자주 걸린다.
+  vec3 c;
+  if(gMix < 0.001)      c = palCool(a);
+  else if(gMix > 0.999) c = palWarm(a);
+  else                  c = mix(palCool(a), palWarm(a), gMix);
+  // 전이 구간에서 빠진 채도를 되살린다(회색 방지). 중간일수록 강하게 보정.
+  if(gDip > 0.001){
+    float g = dot(c, vec3(0.2126, 0.7152, 0.0722));  // 휘도
+    c = mix(c, g + (c - g)*1.55, gDip);
+  }
+  c = hueRotate(c, uHueShift);
+  return clamp(c, 0.0, 1.0);
+}
+
+// ---- Ether 주름 (nimitz 2014, Shadertoy MsjSW3, CC BY-NC-SA 3.0) ----
+//  원본은 자체 렌더러였지만, 여기선 그 "형태를 만드는 수식"만 가져와
+//  큐브/구 SDF에 얹는다. 그래야 크로스페이드가 아니라 진짜 기하 변형이 된다.
+//
+//  sin(x + sin(z + sin(y))) = 중첩된 사인파. 축끼리 서로를 변조해서
+//  격자무늬가 아니라 유기적으로 구불거리는 주름이 나온다.
+//  원본(Shadertoy MsjSW3)의 map()·렌더 루프를 수식 그대로 옮긴다.
+//  형태만 흉내내면 Ether 특유의 안개/발광 느낌이 안 나오므로, 렌더러째로 가져온다.
+//  [최적화] etherMap 안의 회전행렬·시간항은 픽셀 내내 상수인데 스텝마다
+//  다시 계산하면 sin/cos 를 헛되이 반복하게 된다. 한 번만 구해 전역에 담는다.
+mat2 gEmRotXZ, gEmRotXY;
+float gEmEt;
+vec3  gEmOfs;
+vec2  gEmDir;        // 마우스 방향(단위벡터)
+float gEmAmt;        // 쏠림 세기 0~1
+
+void setupEther(){
+  gEmEt = iTime * 0.33;
+  gEmRotXZ = m2(gEmEt*0.4);
+  gEmRotXY = m2(gEmEt*0.3);
+  gEmOfs = vec3(sin(gEmEt*0.7)*0.18);
+  //  마우스 방향·세기를 미리 뽑아 둔다(스텝마다 normalize 하지 않도록).
+  float ml = length(uMouse);
+  gEmDir = (ml > 1e-4) ? uMouse / ml : vec2(0.0);
+  //  화면 가장자리(≈0.8) 근처에서 최대가 되도록 정규화.
+  gEmAmt = clamp(ml / 0.75, 0.0, 1.0);
+}
+
+float etherMap(vec3 p){
+  //  [쏠림] 마우스 방향으로 몸통이 늘어난다. 좌표를 그 축으로만 "압축"해서
+  //  평가하면(나눗셈) 그 방향으로 형체가 뻗어 나온다 — 이동이 아니라 변형이다.
+  //   · u = 마우스 방향 성분, v = 그에 수직인 성분
+  //  [중요] 반드시 자전(gEmRotXY) "앞"에서 화면 좌표 기준으로 적용해야 한다.
+  //   회전 뒤에 두면 쏠림 축이 자전을 따라 돌아가 마우스와 어긋나 보인다
+  //   (방향이 반대로 느껴지는 원인).
+  if(gEmAmt > 0.001){
+    vec2 e = p.xy;
+    float u = dot(e, gEmDir);
+    float v = dot(e, vec2(-gEmDir.y, gEmDir.x));
+    //  마우스 쪽(u>0)이 더 크게 늘어나게 비대칭 계수를 준다.
+    //  [주의] u>0 을 조건 분기로 나누면 u=0 면에서 계수가 뚝 끊겨
+    //  형체에 칼로 자른 듯한 직선 경계가 생긴다. smoothstep으로 이어 준다.
+    //  전이 폭(±0.7)은 형체 반지름(≈1) 수준이어야 자연스럽게 섞인다.
+    float side = smoothstep(-0.7, 0.7, u);
+    //  [세기] 너무 극적이지 않게. 앞뒤 비대칭만 남기고 늘어나는 양은 줄인다.
+    float grow = 1.0 + gEmAmt * mix(0.10, 0.28, side);
+    float squash = 1.0 - gEmAmt * 0.07;
+    u /= grow;
+    v /= squash;
+    p.xy = gEmDir * u + vec2(-gEmDir.y, gEmDir.x) * v;
+  }
+
+  //  [변경] 자전 속도를 원본의 1/3 수준으로 늦춘다(0.4→0.13, 0.3→0.10).
+  //  [최적화] 회전행렬·et는 setupEther()에서 픽셀당 1회 계산해 둔 것을 읽는다.
+  float et = gEmEt;
+  //  [중요] 손 위치로 미는 건 반드시 자전(gEmRot*) "앞"에서 해야 한다.
+  //   회전 뒤에 두면 그 오프셋이 자전을 따라 돌아가서, 손을 오른쪽으로 옮겨도
+  //   변형은 엉뚱한 방향으로 간다(자전 위상에 따라 반대로도 보인다).
+  //   덩어리 전체가 손 쪽으로 살짝 끌린다 — 좌표를 빼면 형체는 그 방향으로 간다.
+  p.xy -= uMouse * 0.22;
+  //  주름(변조항) 좌표도 같은 기준으로 손을 따라간다.
+  vec2 warpOfs = uMouse * 1.35;
+
+  p.xz *= gEmRotXZ;
+  p.xy *= gEmRotXY;
+
+  //  · q 는 주름 무늬를 만드는 좌표계 → 여기를 밀면 "무늬가 흐르는 위치"가 바뀐다.
+  //  · 주름 진폭(0.28)은 그대로 → 울퉁불퉁한 정도는 변하지 않고 위치만 따라온다.
+  vec3 q = (p - vec3(warpOfs, 0.0))*2.0 + et;
+
+  //  [변경] 원본의 vec3(sin(t*0.7))은 세 축을 동시에 밀어 형체를 화면 밖으로
+  //  치우치게 한다(중앙에 안 오는 원인). 진폭을 크게 줄여 중심을 잡는다.
+  //  [변경] 주름 진폭 0.5 → 0.28 로 낮춰 찌그러짐을 줄인다.
+  float d = length(p + gEmOfs)*log(length(p) + 1.0)
+          + sin(q.x + sin(q.z + sin(q.y)))*0.28 - 1.0;
+
+  //  [퇴장] 사방으로 꿈틀거림. 축마다 주파수·속도를 어긋나게 줘야
+  //  한 방향으로 출렁이지 않고 여러 갈래가 제각각 뻗었다 들어간다.
+  if(uWrithe > 0.001){
+    float wt = iTime * 2.3;
+    float w = sin(p.x*2.6 + wt*1.00)
+            + sin(p.y*3.1 - wt*1.37)
+            + sin(p.z*2.2 + wt*0.83);
+    //  거리에 비례해 바깥일수록 크게 뻗는다 → "사방으로 퍼지는" 인상.
+    d -= w * uWrithe * 0.42 * (0.45 + length(p)*0.30);
+  }
+  return d;
+}
+
+//  원본 mainImage 그대로. 반환은 원본 색(검정 배경 전제)과 "얼마나 밝은지"(cover).
+//  [볼류메트릭 유기체] 큐브·하프와 같은 미학으로 유기체를 그린다.
+//  형태(etherMap)는 그대로 두고 "빛을 쌓는 방식"만 큐브 것으로 바꾼다.
+//   · 원본: cl = cl*l  (곱셈 누적) → 지수적으로 폭발 = 발광하는 성운
+//   · 여기: col += pal(t)*w*(1-a) (앞에서 뒤로 알파 합성) → 층이 겹친 파스텔
+//  이 차이가 두 씬의 인상을 가르는 핵심이라, 여기만 바꾸면 미학이 통일된다.
+//  유기체 밀도는 슬라이더(uDensity) 값을 그대로 쓴다. 배수를 곱하면
+//  슬라이더 숫자와 실제 밀도가 어긋나 씬별 기본값을 맞추기 어렵다.
+const float EV_DENSITY = 1.0;
+//  광선이 형체를 지나며 팔레트를 훑는 폭. 큐브는 0.8(색상환 3.85바퀴)인데
+//  유기체는 훑는 구간이 짧고 스텝도 적어, 같은 값을 쓰면 스텝당 색 변화가
+//  커져 줄무늬·모아레로 보인다. 0.34면 스텝당 회전이 큐브와 비슷해진다.
+const float EV_PAL_SPAN = 0.34;
+
+vec4 etherVolume(vec2 uv){
+  vec3 rd = normalize(vec3(uv, -1.0));
+  vec3 ro = vec3(0.0, 0.0, 5.0);
+  vec4 col = vec4(0.0);
+
+  //  [크기] etherMap의 형체는 반지름 1 남짓. 좌표를 나눠 평가하면 그만큼 커진다.
+  //  (형체는 원점에 있으므로 반드시 원점 기준으로 나눠야 한다.)
+  float evScale = 1.05 * uEtherZoom;
+
+  //  [최적화] 형체를 감싸는 구를 광선이 스치지도 않으면 루프를 통째로 건너뛴다.
+  //  화면 대부분의 픽셀이 여기서 걸러진다 — 큐브에서 3배를 벌어준 바로 그 수법.
+  //  [클리핑 주의] 반경을 실제 형체보다 작게 잡으면 가장자리가 잘려나간다.
+  //  표면(d=0)의 최대 반경을 수치로 재보면 기본 1.62, 꿈틀이 최대일 때 2.41이다.
+  //  꿈틀 세기(uWrithe)에 따라 늘려 주고, 경계 두께만큼 여유를 더한다.
+  //  [클리핑 주의] 반경은 "일어날 수 있는 모든 변형"을 덮어야 한다.
+  //   · 쏠림(grow)이 형체를 늘이고
+  //   · 덩어리 이동(uMouse*0.22)이 중심을 옮기며
+  //   · 꿈틀(uWrithe)이 팔을 뻗는다
+  //  하나라도 빠뜨리면 그 방향이 직선으로 잘려 나간다.
+  //  [여유값 조이기] 반경이 클수록 조기 종료로 걸러지는 픽셀이 줄어 느려진다.
+  //  실제 형체 최대 반경(1.62)에 최소한의 여유만 남긴다. 경계 두께는 표면을
+  //  바깥으로 번지게 하지만 그 전부가 아니라 절반 정도만 반영하면 충분하다.
+  //  (측정: 여유를 조이면 약 13% 빨라진다)
+  float leanGrow = 1.0 + gEmAmt * 0.28;
+  float bRad = (1.66 + 0.82 * uWrithe) * leanGrow * evScale
+             + length(uMouse) * 0.22 * evScale     // 중심 이동분
+             + uEdge * 0.6 + 0.08;                 // 경계 번짐 + 최소 여유
+  float tca = dot(-ro, rd);
+  float d2  = dot(ro, ro) - tca*tca;
+  if(d2 > bRad*bRad) return vec4(0.0);
+
+  //  광선이 구를 통과하는 구간만 훑는다(빈 공간 샘플링 제거).
+  float thc = sqrt(max(bRad*bRad - d2, 0.0));
+  float t0 = max(tca - thc, 0.1);
+  float t1 = tca + thc;
+
+  //  [스텝] 큐브와 같은 가변 스텝. 균등하게 걸으면 층 간격이 기계적으로 보인다
+  //  (원본 큐브도 (0.1 + t*0.8) 꼴로 뒤로 갈수록 성큼성큼 걷는다).
+  //  [스텝 수] 슬라이더(uSteps)를 그대로 따른다. 유기체 씬 기본값은 20.
+  //  측정: 34→20 에서 약 32% 빨라지고 눈에 띄는 차이는 거의 없다.
+  //  단 14 이하로 내리면 색이 동심원 띠로 끊겨 보인다(스텝 사이가 벌어져
+  //  팔레트가 계단처럼 튄다) → 20이 화질·비용의 균형점.
+  //  [WebGL1] 루프 상한은 컴파일 상수여야 하므로 넉넉히 잡고 n으로 조기 종료한다.
+  const int EV_MAX = 120;
+  float n = max(uSteps, 2.0);
+  float span = t1 - t0;
+  float dist = t0;
+
+  for(int i = 0; i < EV_MAX; i++){
+    if(float(i) >= n) break;
+    float t = float(i) / n;                    // 0..1 진행률
+    //  가변 스텝: 앞은 촘촘히, 뒤는 성큼. 합이 span이 되도록 정규화(1.3 = ∫(0.5+0.8t)).
+    float stepLen = (0.5 + t * 0.8) * span / (1.3 * n) * 2.0;
+    dist += stepLen;
+    if(dist > t1) break;
+
+    vec3 p = ro + rd * dist;
+    float d = etherMap(p / evScale);
+
+    //  [밀도] 큐브와 완전히 같은 형태: smoothstep(uEdge, 0, d).
+    //  경계 바깥(d>uEdge)은 0, 표면(d=0)에서 1이 되고 안쪽은 계속 1이다.
+    //  [핵심] 큐브는 도형 안이 "꽉 찬 1"이어도 스텝당 기여(w)가 작아서
+    //  여러 층이 겹쳐 보인다. 여기도 같은 규칙을 그대로 쓴다.
+    float c = smoothstep(uEdge, 0.0, d);
+    if(c <= 0.001) continue;
+
+    //  큐브와 같은 기여식(c * uDensity * 80/n). 큐브는 37스텝에서 ≈2.16이다.
+    //  [밀도] 유기체는 훑는 구간이 짧아 큐브와 같은 밀도로는 옅게 나온다.
+    //  씬 기본 밀도 배수(1.5)를 곱해 균형을 맞춘다.
+    float w = c * uDensity * (80.0 / n) * EV_DENSITY;
+    //  [색] 큐브와 같은 규칙: 광선 진행률(t)로 팔레트를 훑는다.
+    //  [주의] 여기에 위치 기반 흔들림(sin 변조)을 섞으면 스텝 샘플링과 간섭해
+    //  모아레가 생긴다. 색은 t에 대해 단조롭게 흘러야 깨끗하다.
+    //  줄무늬가 촘촘해 보이면 EV_PAL_SPAN을 줄이고(색이 천천히 변함),
+    //  단조로우면 늘린다 — 이 계수 하나로 층 간격을 조절한다.
+    col += vec4(pal(t * EV_PAL_SPAN + 0.1) * w, w) * (1.0 - col.a);
+    if(col.a > 0.995) break;
+  }
+  return col;
+}
+
+vec3 etherRender(vec2 uv, out float cover){
+  //  [변경] 형체가 화면 중앙에 오도록. 원본의 -vec2(.9,.5)는 좌하단 기준 좌표계용이라
+  //  중앙 기준인 이 파일에선 오프셋이 필요 없다(넣으면 한쪽으로 치우친다).
+  //  [변경] 형체 크기 70%. uv를 키우면(1/0.7) 같은 화면에 도형이 작게 담긴다.
+  //  [변경] 기본 70% 크기에 등장/퇴장 배율(uEtherZoom)을 곱한다.
+  //   uv를 나누므로 zoom이 크면 도형이 커진다.
+  vec2 pp = uv / (0.7 * uEtherZoom);
+  vec3 cl = vec3(0.0);
+  float d = 2.5;
+  for(int i = 0; i <= 5; i++){
+    vec3 p = vec3(0.0, 0.0, 5.0) + normalize(vec3(pp, -1.0))*d;
+    float rz = etherMap(p);
+    //  [변경] 원본은 (0.1,0.1,0.1) 고정 방향의 기울기라 밝은 면(보라·흰색)이
+    //  항상 같은 쪽에 붙는다. 이 표본 방향을 마우스 쪽으로 돌려
+    //  "빛이 마우스에서 온다"처럼 보이게 한다.
+    //  부호를 뒤집어야(-uMouse) 마우스가 있는 쪽이 밝아진다.
+    vec3 lightDir = normalize(vec3(-uGlow * 1.6, 0.6) + vec3(0.001));
+    float f  = clamp((rz - etherMap(p + lightDir*0.17))*0.5, -0.1, 1.0);
+    vec3  l  = vec3(0.1, 0.3, 0.4) + vec3(5.0, 2.5, 3.0)*f;
+    cl = cl*l + smoothstep(2.5, 0.0, rz)*0.7*l;
+    d += min(rz, 1.0);
+  }
+  //  원본은 검정 배경에 발광을 얹는 방식 → 밝기 자체가 곧 "덮인 정도".
+  cover = clamp(max(max(cl.r, cl.g), cl.b), 0.0, 1.0);
+  return cl;
+}
+
+// 원본은 iTime으로 자전. 여기선 마우스가 누적한 각(uSpin)으로 돌린다.
+//  smoothstep 폭(uEdge)이 경계의 물렁함을 정한다. 0에 가까울수록 딱딱한 표면.
+float cyl(vec3 p){
+  p.xz *= gRotXZ;
+  p.xy *= gRotXY;
+  //  큐브(반너비 2)와 구(반지름 2.3)를 uShape로 오간다. 두 SDF를 섞으면
+  //  중간값에서 모서리가 둥글어지며 자연스럽게 변형된다.
+  //  늘이기: 좌표를 반대로 곱해(p*invScale) 도형을 키운다. SDF가 정확한 거리가
+  //  아니게 되므로 가장 작은 축(gScaleFix)을 곱해 경계 두께를 균일하게 보정.
+  vec3 q = p * gInvScale;
+  float d = mix(box(q, vec3(2.0)), sphere(q, 2.3), uShape);
+
+  return smoothstep(uEdge, 0.0, d * gScaleFix);
+}
+
+// ================== 하프 연주 씬 ==================
+//  화면을 가로지르는 얇은 직육면체(판)를 세로로 늘어놓는다. 각 판은 두께가
+//  제각각이고, 마우스에 따라 Z축(화면을 뚫는 축)으로 돌아간다. 정면에서 보면
+//  판의 "보이는 너비"가 회전각에 따라 변해서 하프 줄처럼 굵기가 출렁인다.
+//
+//  [비용] 판마다 box()를 부르면 개수만큼 비싸진다. 대신 X축 도메인 반복으로
+//  "지금 이 점에서 가장 가까운 판"을 나눗셈 한 번으로 찾아낸다 → 판이 몇 개든
+//  스텝당 SDF 평가는 1회. 큐브와 거의 같은 비용으로 수십 장을 그린다.
+
+//  판 인덱스 → 0~1 난수 두 개(두께용·위상용). 정수 해시라 프레임마다 안 흔들린다.
+vec2 slabRand(float id){
+  float a = fract(sin(id * 12.9898) * 43758.5453);
+  float b = fract(sin(id * 78.2330 + 3.1) * 24634.6345);
+  return vec2(a, b);
+}
+
+//  하프 씬은 판이 카메라를 마주 보는 "평평한 배열"이라, 광선을 걸어 다닐
+//  필요가 없다. 판을 하나씩 훑으며 화면에 직접 합성한다 — 레이마칭보다 훨씬
+//  싸고, 얇은 판을 스텝이 건너뛰어 생기는 모아레·동심원 무늬도 없다.
+//
+//  [중요] 도메인 반복(floor로 칸 나누기)을 쓰지 않는다. 칸을 나누면 판이
+//  자기 칸을 벗어날 수 없어 서로 겹치지 못하고, 결국 균일한 격자로 보인다.
+//  대신 판마다 독립적인 x 위치·깊이를 주고 뒤에서 앞으로 겹쳐 칠한다.
+//  겹치는 부분은 알파가 누적돼 진해지면서 그라데이션처럼 읽힌다.
+//
+//  각 판은 자기 세로축을 중심으로 회전한다. 정면이면 폭 w가 그대로 보이고,
+//  90° 돌면 두께 dz만 보인다 → 화면에서는 굵기가 출렁이는 하프 줄이 된다.
+const int HARP_MAX = 260;     // 컴파일 상수여야 해서 넉넉히 잡고 uHarpCount로 끊는다
+//  [주의] 이건 "픽셀당 검사할 판 수의 상한"이다. 컬링이 실제 검사량을 줄이므로
+//  총 판 수를 늘려도 이 값까지 다 돌지는 않는다.
+const float HARP_PULL_R = 0.34;   // 인력이 미치는 반경(화면 uv 기준)
+//  판 중심이 pitch만큼 흔들리고 인력으로도 밀리므로, 자기 몫(pitch/2)보다
+//  넉넉히 덮어야 실제로 틈이 안 생긴다. 1.0 = 딱 맞음(틈 생김), 크게 = 안전.
+const float HARP_GUARD = 3.8;
+
+vec4 harpRender(vec2 uv){
+  //  [전환 확대] uv를 줄이면 같은 화면에 더 좁은 영역이 담긴다 = 중앙으로 확대.
+  //  카메라가 판 쪽으로 다가가는 것과 같은 결과인데, 이쪽이 훨씬 싸다
+  //  (판은 화면을 마주 보는 평면이라 원근이 따로 없다).
+  uv /= max(uHarpZoom, 1e-3);
+
+  float n = uHarpCount;
+  //  판이 놓이는 가로 범위. 화면(대략 ±0.9)보다 넉넉히 잡아 가장자리에서
+  //  판이 갑자기 끊기지 않게 한다 = 클리핑처럼 보이는 것 방지.
+  float span = 2.6;
+  float pitch = span / n;
+
+  vec4 acc = vec4(0.0);      // premultiplied 누적
+
+  //  [최적화] 판 하나는 화면의 좁은 x 구간만 덮는데, 그냥 돌면 픽셀마다
+  //  65장을 전부 검사하게 된다. 판 중심은 id에 대해 대체로 단조증가하므로
+  //  "이 픽셀에 닿을 수 있는 id 범위"를 미리 구해 그 바깥은 아예 안 본다.
+  //   최대 이탈량 = 흔들림(±0.9·pitch) + 인력(±최대 이동) + 최대 반폭.
+  float maxHalf = pitch * 0.5 * uHarpSpread * 2.2 * uHarpThick;
+  maxHalf = max(maxHalf, pitch * 0.5 * HARP_GUARD);
+  //  [컬링 정확도] 인력의 실제 최대 이동량은 "인력 반경 × 최대 계수"다.
+  //   계수: 0.55 * mix(0.6,1.25,r.y) ≤ 0.55*1.25 = 0.6875, 여기에 세기(≤1)를 곱한다.
+  //   PULL_R을 통째로 더하면(0.34) 실제보다 45% 넓게 잡아 판이 많을수록
+  //   픽셀당 검사량이 크게 늘어난다 — 판 수를 올릴 때 이게 병목이 된다.
+  //  [최적화] 인력 여유를 화면 전체에 똑같이 주면, 손에서 멀어 아무 영향도 없는
+  //   픽셀까지 검사량이 4.5배로 뛴다(측정: 픽셀당 6장 → 27장). 손을 드는 순간
+  //   프레임이 떨어지는 원인이 이것이다.
+  //   → 이 픽셀이 인력 중심에서 얼마나 떨어졌는지로 여유를 줄인다. 인력 자체가
+  //     exp(-d²)로 감쇠하므로, 반경 밖 픽셀은 실제로 밀리지 않는다.
+  float pa1 = (uv.x - uHarpPull.x)  / HARP_PULL_R;
+  float pa2 = (uv.x - uHarpPull2.x) / HARP_PULL_R;
+  float pullMax = HARP_PULL_R * 0.6875 *
+      max(exp(-pa1*pa1) * clamp(uHarpPull.y,  0.0, 1.0),
+          exp(-pa2*pa2) * clamp(uHarpPull2.y, 0.0, 1.0));
+  float reach = maxHalf + pitch * 0.9 + pullMax;
+  //  [주의] 간격이 벌어지면(uHarpGap) 판 중심이 cx*gap 으로 이동한다.
+  //  컬링 범위를 gap으로 되돌려 계산해야 판이 잘려나가지 않는다.
+  float g = max(uHarpGap, 1e-3);
+  float idLo = floor(((uv.x - reach)/g + span*0.5) / pitch - 0.5);
+  float idHi = ceil (((uv.x + reach)/g + span*0.5) / pitch - 0.5);
+  idLo = max(idLo, 0.0);
+  idHi = min(idHi, n - 1.0);
+
+  //  뒤(i=0)에서 앞(i=n-1)으로 그린다. 앞 판이 뒤 판을 덮도록.
+  for(int i = 0; i < HARP_MAX; i++){
+    float id = float(i) + idLo;                // 닿을 수 있는 구간만 훑는다
+    if(id > idHi) break;
+    vec2  r  = slabRand(id);
+    //  세 번째 난수: 위치 흔들기용(두께·회전과 독립이어야 규칙성이 안 보인다).
+    float r3 = fract(sin(id * 45.164 + 7.7) * 13571.9531);
+
+    //  [겹침의 핵심] 판 중심을 격자 위치에서 흔든다. 흔들림이 간격(pitch)
+    //  수준이면 이웃을 넘어가 실제로 겹친다 — 예시 사진처럼 앞뒤로 어긋난 배치.
+    //  [빈 곳] 흔들림이 너무 크면 판이 몰려 반대쪽이 뚫린다. 폭을 아무리 키워도
+    //  못 메우므로 흔들림 자체를 제한한다(1.8 = 여유 3.8과 함께 모든 슬라이더
+    //  조합에서 틈 0 — 수치 스캔으로 확인).
+    float cx = (id + 0.5) * pitch - span*0.5 + (r3 - 0.5) * pitch * 1.8;
+
+    //  [전환] 판 간격을 벌린다. 중심에서 바깥으로 밀어내면 서로 멀어지며
+    //  틈이 생긴다 — 흩어져 사라지는 인상.
+    cx *= uHarpGap;
+
+    //  [인력] 마우스에 가까운 판 몇 개가 마우스 쪽으로 수평으로 끌려간다.
+    //  가우시안이라 가까울수록 세게, 멀어지면 자연스럽게 0이 되어 제자리로
+    //  돌아온다 — 복귀를 따로 처리할 필요가 없다(끌림 자체가 거리의 함수).
+    //  부드러움은 JS가 마우스를 저역통과 필터로 따라가며 만든다(uHarpPull).
+    //  [양손] 두 개의 인력 중심에서 각각 끌린다. 손이 하나면 나머지 세기가 0이라
+    //  자동으로 한 손짜리처럼 동작한다(마우스 폴백도 동일).
+    float md = (cx - uHarpPull.x) / HARP_PULL_R;
+    float fall = exp(-md*md);                  // 1(코앞) → 0(멀리)
+    //  판마다 끌리는 정도를 다르게 해야 한 덩어리로 밀리지 않는다.
+    cx += (uHarpPull.x - cx) * fall * 0.55 * mix(0.6, 1.25, r.y) * uHarpPull.y;
+    float md2 = (cx - uHarpPull2.x) / HARP_PULL_R;
+    float fall2 = exp(-md2*md2);
+    cx += (uHarpPull2.x - cx) * fall2 * 0.55 * mix(0.6, 1.25, r.y) * uHarpPull2.y;
+
+    //  판마다 폭이 제각각. 최댓값은 그대로 두고 최솟값을 크게 낮춰
+    //  "아주 얇은 판 ↔ 아주 넓은 판"이 함께 보이도록 한다.
+    //  r.x를 세제곱하면 분포가 얇은 쪽으로 쏠린다 → 넓은 판은 가끔,
+    //  가는 판이 다수. 균등분포보다 훨씬 극적으로 보인다.
+    float wr = r.x*r.x*r.x;
+    float w  = pitch * 0.5 * uHarpSpread * mix(0.10, 2.2, wr) * uHarpThick;
+    //  [빈 곳 없음 보장] 옆면 두께. 모든 판이 90°로 돌아 옆면만 보이는
+    //  최악의 경우에도 화면이 메워지려면, 판 하나가 자기 몫의 간격(pitch)을
+    //  덮어야 한다 → 반폭 dz ≥ pitch/2. 여기에 겹침 여유 GUARD를 곱한다.
+    //  (판 중심이 흔들려 있으므로 여유가 없으면 틈이 생긴다.)
+    float dzMin = pitch * 0.5 * HARP_GUARD;
+    float dz = max(pitch * 0.13 * uHarpThick, dzMin);
+
+    //  [회전] 판마다 "출발 각도"가 완전히 달라야 한다. 다 같은 각에서 출발하면
+    //  마우스를 돌릴 때 전부 똑같은 모양으로 얇아져 한 몸처럼 보인다.
+    //  r4로 0~180°를 고루 뿌리고(정면·비스듬·옆면이 섞임),
+    //  거기에 자체 회전(시간)과 마우스 회전량을 판마다 다른 비율로 더한다.
+    float r4 = fract(sin(id * 91.377 + 2.3) * 8917.4531);
+    //  [자체 회전] 마우스가 없어도 각 판이 아주 천천히 제자리에서 돈다.
+    //  속도를 판마다 다르게(0.02~0.075 rad/s ≈ 한 바퀴에 80~300초) 두고,
+    //  약 30%는 반대 방향으로 돌려 전체가 한 흐름으로 쓸리지 않게 한다.
+    float r7 = fract(sin(id * 38.219 + 9.4) * 27183.1357);
+    float spinDir = (r7 < 0.3) ? -1.0 : 1.0;
+    float selfSpin = uTime * mix(0.020, 0.075, r7) * spinDir;
+    //  [거리 매핑] 마우스에서 멀수록 덜 돈다. uHarpTurn을 그대로 곱하면
+    //  화면 전체가 한 몸처럼 같은 각도로 돌아 "마우스가 판을 돌린다"는 인상이 없다.
+    //  판 중심과 마우스의 가로 거리로 감쇠시킨다 — 인력(cx 이동)과 같은 성격이라
+    //  같은 반경을 쓰되, 회전은 더 넓게 퍼지도록 반경을 조금 키운다.
+    float turnD  = (cx - uHarpPull.x)  / (HARP_PULL_R * 2.2);
+    float turnD2 = (cx - uHarpPull2.x) / (HARP_PULL_R * 2.2);
+    //  두 손 각각의 영향을 합치되 1을 넘지 않게(가까운 손이 지배).
+    float turnFall = max(exp(-turnD*turnD) * uHarpPull.y,
+                         exp(-turnD2*turnD2) * uHarpPull2.y);
+    //  전환 회전(uHarpSpin)도 판마다 다른 비율로 얹어 제각각 돌게 한다.
+    float ang = r4 * 3.14159 + selfSpin + uHarpSpin * mix(0.7, 1.35, r.x)
+              + uHarpTurn * turnFall * mix(0.55, 1.55, r.y);
+    float ca = abs(cos(ang)), sa = abs(sin(ang));
+    float halfW = w*ca + dz*sa;                // 회전한 직사각형의 투영 반폭
+    //  회전 각도와 무관하게 최소 투영폭을 보장한다. 정면(w)이든 옆면(dz)이든
+    //  이 값 아래로는 안 내려가므로 어떤 각도 조합에서도 빈 곳이 안 생긴다.
+    halfW = max(halfW, dzMin);
+
+    //  경계 물렁함은 판 폭에 비례해야 굵은 판/얇은 판이 같은 인상을 준다.
+    float soft = uEdge * pitch * 0.9;
+    float cov = smoothstep(halfW + soft, halfW - soft, abs(uv.x - cx));
+    if(cov <= 0.002) continue;                 // 이 판은 이 픽셀을 안 덮는다
+
+    //  판이 옆으로 돌수록 얇아지고 동시에 옅어진다(유리판을 비스듬히 볼 때처럼).
+    //  [중요] 판 하나는 반투명이어야 한다. 불투명하면 앞 판이 뒤 판을 완전히
+    //  덮어버려 겹쳐도 티가 안 난다 — 겹침이 색으로 드러나려면 알파가 쌓여야 한다.
+    //  하프는 씬 기본 밀도가 1.6이다(다른 씬의 10배 이상). 계수를 낮춰
+    //  실제 알파는 기존과 같은 수준을 유지한다(1.6 × 0.357 ≈ 0.11 × 5.2).
+    float dens = mix(1.0, 0.6, sa) * uDensity * 0.357;
+    float a = clamp(cov * dens, 0.0, 0.80);
+
+    //  색은 판마다 완전히 무작위. id에 비례시키면 왼쪽→오른쪽으로 색이
+    //  순서대로 흐르는 게 눈에 보이므로, 난수(r6)만으로 팔레트 위치를 정한다.
+    //  [자체 변화] 마우스가 없어도 시간에 따라 아주 느리게 색이 흘러간다.
+    //  판마다 흐르는 속도를 조금씩 달리해(r.x) 전체가 한꺼번에 물들지 않는다.
+    float r6 = fract(sin(id * 63.719 + 1.7) * 51237.1234);
+    vec3 c = pal(r6 * 6.0 + uTime * (0.010 + r.x * 0.008));
+
+    //  뒤→앞 순서라 "이미 칠해진 만큼은 가려진다"(1-acc.a)로 합성.
+    acc += vec4(c * a, a) * (1.0 - acc.a);
+    if(acc.a > 0.995) break;                   // 이미 불투명하면 앞 판만 남는다
+  }
+  return acc;
+}
+
+void main(){
+  setupShape();      // 회전행렬·스케일을 픽셀당 1회만 계산
+  setupPalette();    // 팔레트 혼합비도 1회만
+  setupEther();      // 유기체 회전행렬·시간항도 1회만
+
+  vec2 uv = (gl_FragCoord.xy - iResolution.xy*0.5)/iResolution.y;
+
+  // ---- 하프 연주 씬 ----
+  //  광선을 걷지 않고 픽셀당 한 번에 그린다(위 harpRender 주석 참고).
+  if(uHarp > 0.5){
+    vec4 hc = harpRender(uv);
+    hc *= uHarpFade;                               // 퇴장 시 흰 배경으로 녹는다
+    vec3 o = vec3(1.0)*(1.0 - hc.a) + hc.rgb;      // 흰 배경 위에 얹기
+    float dth = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    gl_FragColor = vec4(clamp(o + (dth - 0.5)/255.0, 0.0, 1.0), 1.0);
+    return;
+  }
+
+  vec3 rd = normalize(vec3(uv, -1.0));
+  vec3 p  = vec3(0.0, 0.0, 12.0);
+  vec4 col = vec4(0.0);
+
+  // 볼류메트릭 누적. 스텝 수/방식을 슬라이더로 실시간 비교한다.
+  //  MAX는 컴파일 상수여야 하므로(WebGL1) 넉넉히 잡고 uSteps로 조기 종료.
+  const int MAX_STEPS = 320;
+  float n = uSteps;
+  // 균일 모드: 카메라(z=12)에서 박스를 통과할 만큼(≈8~16) 일정 폭으로 전진.
+  //  원본 가변 모드와 총 이동거리를 맞춰야 두 모드의 크기가 같아 보인다.
+  //  도형이 커지면 그만큼 앞뒤로 넓게 훑어야 잘리지 않는다(z축은 uScale만 영향).
+  float halfSpan = 2.4 * uScale;            // 'half'는 GLSL 예약어라 쓸 수 없다
+  float NEAR = max(12.0 - halfSpan - 1.0, 0.1);
+  float FAR  = 12.0 + halfSpan + 1.0;
+  float uniformStep = (FAR - NEAR) / n;
+  // 균일 모드는 NEAR까지 한 번에 건너뛴 뒤 시작(빈 공간 샘플링 낭비 제거).
+  p += rd * (NEAR * uStepMode);
+
+  //  [최적화] 도형을 감싸는 구와 광선이 만나는지 먼저 본다. 화면 대부분의
+  //  픽셀은 도형을 스치지도 않는데 37스텝을 다 도는 게 가장 큰 낭비였다.
+  //  (측정: 본체 루프가 전체 비용의 약 85%)
+  vec3  ro = vec3(0.0, 0.0, 12.0);
+  //  반경은 "가장 먼 점"까지여야 한다. 큐브의 꼭짓점은 중심에서 2*sqrt(3)≈3.46
+  //  (면 중앙 2.0이 아니다) — 여기를 2.9로 잡아 모서리가 잘렸었다.
+  //  늘이기는 축별로 곱해지므로 대각선 길이를 그대로 계산한다(max로는 부족).
+  vec3  ext = vec3(uStretch, 1.0) * uScale * 2.0;   // 축별 반너비
+  float bRad = length(ext)                          // 꼭짓점까지의 거리
+             + uEdge                                // 경계 뭉갬만큼 더
+             + 0.35;                                // 안전 여유
+  //  구 모드는 반지름 2.3이 기준이라 큐브보다 크다 → 더 큰 쪽을 쓴다.
+  bRad = max(bRad, 2.3 * uScale * max(max(uStretch.x, uStretch.y), 1.0) + uEdge + 0.35);
+  float tca  = dot(-ro, rd);                       // 구 중심(원점)까지의 투영 거리
+  float d2   = dot(ro, ro) - tca*tca;              // 광선-중심 최단거리²
+  //  Ether는 화면 전체를 덮는 별도 렌더라 조기 종료를 쓰면 안 된다(꺼져 있을 때만 유효).
+  if(d2 > bRad*bRad && uEther < 0.001){            // 완전히 빗나감 → 본체 생략
+    //  [변경] 배경 색 레이어 제거 → 순수 흰색.
+    vec3 bgOnly = vec3(1.0);
+    float dth = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    gl_FragColor = vec4(clamp(bgOnly + (dth - 0.5)/255.0, 0.0, 1.0), 1.0);
+    return;
+  }
+
+  for(int i = 0; i < MAX_STEPS; i++){
+    if(float(i) >= n) break;
+    float t = float(i) / n;                 // 0..1 진행률
+
+    // 원본 가변 스텝: p += rd*i (i가 커질수록 성큼성큼 → 뒤쪽이 뭉개짐)
+    float varStep = (0.1 + t*0.8) * (80.0/n);
+    float stepLen = mix(varStep, uniformStep, uStepMode);
+
+    p += rd*stepLen;
+    float c = cyl(p);
+    //  [최적화] 빈 공간이면 팔레트 계산을 통째로 건너뛴다. 도형 밖 스텝이
+    //  대부분이라(특히 화면 가장자리 픽셀) 여기서 가장 크게 절약된다.
+    if(c <= 0.001) continue;
+    // 스텝이 촘촘할수록 스텝당 기여를 줄여야 전체 밝기가 유지된다.
+    //  균일 모드는 스텝 길이에 비례(물리적으로 올바른 누적), 가변 모드는 원본 스케일.
+    float w = c * uDensity * mix(80.0/n, stepLen * 8.0, uStepMode);
+    //  [인트로 색] 팔레트 자체는 큐브 기준으로 고정하고, 결과 색만 파랑 쪽으로
+    //   끌어당긴다(uBlueTint 1→0). 팔레트 입력을 건드리면 — 폭이든 주파수든 —
+    //   같은 지점의 색이 색상환을 훑어 무지개가 스쳐 지나간다(수치로 확인).
+    //   틴트는 RGB를 직선으로 섞을 뿐이라 색상환을 돌지 않는다.
+    vec3 pc = pal(t*0.8 + 0.1);
+    pc = mix(pc, INTRO_BLUE, uBlueTint);
+    col += vec4(pc*w, w)*(1.0 - col.a);
+    if(col.a > 0.995) break;                // 이미 불투명하면 뒤쪽은 안 보인다
+  }
+
+  // [퇴장 연출] 큐브를 서서히 지운다(회전 가속은 JS가 uSpin에 실어 보낸다).
+  //  premultiplied 누적이라 rgb·a를 같이 줄여야 흰 배경으로 자연스럽게 녹는다.
+  col *= uCubeFade;
+
+  //  [변경] 배경 색 레이어 제거 → 순수 흰색.
+  vec3 bg = vec3(1.0);
+  vec3 outc = bg*(1.0 - col.a) + col.rgb;
+
+  // ---- Ether 크로스페이드 ----
+  //  원본은 검정 배경에 발광을 얹는 그림이다. 흰 배경 요청이므로
+  //  "밝을수록 흰색에서 멀어지는" 형태로 반전해 얹는다(색상 자체는 원본 그대로).
+  if(uEther > 0.001){
+    //  [볼류메트릭 모드] 큐브·하프와 같은 누적 방식. 팔레트도 그대로 공유하므로
+    //  세 씬의 색·질감이 하나로 통일된다.
+    if(uEtherStyle > 0.5){
+      vec4 ev = etherVolume(uv);
+      vec3 evOnWhite = vec3(1.0)*(1.0 - ev.a) + ev.rgb;
+
+      //  [마우스 글로우] 원본 발광 렌더러와 같은 성격의 밝은 빛무리.
+      //  형체가 있는 곳(ev.a)에서만 밝아지게 해야 흰 여백에 동그란 얼룩이 안 뜬다.
+      //  흰색으로 섞으면 색이 날아가므로 "밝기를 밀어올리는" 방식으로.
+      float mdv = length(uv - uGlow);
+      float glowV = exp(-mdv*mdv*7.0);
+      evOnWhite = evOnWhite + (1.0 - evOnWhite) * glowV * ev.a * 0.8;
+
+      outc = mix(outc, evOnWhite, uEther);
+      float dth2 = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+      gl_FragColor = vec4(clamp(outc + (dth2 - 0.5)/255.0, 0.0, 1.0), 1.0);
+      return;
+    }
+
+    float cover;
+    vec3 e = etherRender(uv, cover);
+
+    //  [색조 이동] 유기적 도형(Ether)의 색만 회전시킨다. 큐브·배경은 영향 없음.
+    //   흰 배경 위에 얹기 전에 돌려야 흰색이 물들지 않는다.
+    e = hueRotate(e, uHueShift);
+
+    //  원본 색을 흰 바탕 위로: 어두운 곳=흰색, 밝은 곳=원본 색이 진하게.
+    vec3 eOnWhite = mix(vec3(1.0), clamp(e, 0.0, 1.0), clamp(cover*1.6, 0.0, 1.0));
+
+    //  [추가] 마우스를 따라다니는 밝은 글로우. 형체가 있는 곳에서만 빛나게
+    //  cover를 곱해야 흰 여백에 동그란 얼룩이 뜨지 않는다.
+    //  형체가 0.7배로 작아졌으므로 글로우 범위도 같은 비율로 좁힌다.
+    float md = length(uv - uGlow);
+    float glow = exp(-md*md*(7.0/(0.7*0.7)));      // 글로우 중심으로 부드럽게 감쇠
+    //  형체 위에서만 빛나게 cover를 곱한다(흰 여백에 동그란 얼룩 방지).
+    //  단순히 흰색으로 섞으면 색이 날아가므로, 밝기를 밀어올리는 방식으로.
+    eOnWhite = eOnWhite + (1.0 - eOnWhite) * glow * cover * 0.85;
+
+    outc = mix(outc, eOnWhite, uEther);
+  }
+
+  // 디더: 완만한 그라디언트의 8비트 밴딩 제거.
+  float dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+  outc += (dither - 0.5)/255.0;
+
+  gl_FragColor = vec4(clamp(outc, 0.0, 1.0), 1.0);
+}
+</script>
+
+<script>
+const canvas = document.getElementById('gl');
+const statusEl = document.getElementById('status');
+const gl = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: false });
+if(!gl){ document.body.innerHTML='<p style="padding:20px">WebGL을 사용할 수 없습니다.</p>'; }
+
+function compile(type, src){
+  const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER,   document.getElementById('vert').textContent));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('frag').textContent));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+const posLoc = gl.getAttribLocation(prog, 'pos');
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+const uRes    = gl.getUniformLocation(prog, 'uRes');
+const uTime   = gl.getUniformLocation(prog, 'uTime');
+const uSpin   = gl.getUniformLocation(prog, 'uSpin');
+const uHue    = gl.getUniformLocation(prog, 'uHue');
+const uSteps    = gl.getUniformLocation(prog, 'uSteps');
+const uStepMode = gl.getUniformLocation(prog, 'uStepMode');
+const uEdge     = gl.getUniformLocation(prog, 'uEdge');
+const uDensity  = gl.getUniformLocation(prog, 'uDensity');
+const uShape    = gl.getUniformLocation(prog, 'uShape');
+const uEther    = gl.getUniformLocation(prog, 'uEther');
+const uMouse    = gl.getUniformLocation(prog, 'uMouse');
+const uHueShift = gl.getUniformLocation(prog, 'uHueShift');
+const uCubeFade = gl.getUniformLocation(prog, 'uCubeFade');
+const uWrithe   = gl.getUniformLocation(prog, 'uWrithe');
+const uEtherZoom= gl.getUniformLocation(prog, 'uEtherZoom');
+const uScale    = gl.getUniformLocation(prog, 'uScale');
+const uStretch  = gl.getUniformLocation(prog, 'uStretch');
+const uHarp      = gl.getUniformLocation(prog, 'uHarp');
+const uHarpCount = gl.getUniformLocation(prog, 'uHarpCount');
+const uHarpTurn  = gl.getUniformLocation(prog, 'uHarpTurn');
+const uHarpThick = gl.getUniformLocation(prog, 'uHarpThick');
+const uHarpSpread= gl.getUniformLocation(prog, 'uHarpSpread');
+const uHarpPull  = gl.getUniformLocation(prog, 'uHarpPull');
+const uHarpPull2 = gl.getUniformLocation(prog, 'uHarpPull2');
+const uGlow      = gl.getUniformLocation(prog, 'uGlow');
+const uHarpZoom  = gl.getUniformLocation(prog, 'uHarpZoom');
+const uHarpSpin  = gl.getUniformLocation(prog, 'uHarpSpin');
+const uHarpGap   = gl.getUniformLocation(prog, 'uHarpGap');
+const uHarpFade  = gl.getUniformLocation(prog, 'uHarpFade');
+const uEtherStyle= gl.getUniformLocation(prog, 'uEtherStyle');
+const uBlueTint  = gl.getUniformLocation(prog, 'uBlueTint');
+
+// ---- 씬 상태 ----
+//  씬 3개(큐브 / 유기체 / 하프)를 서로 오간다. 실제 전환은 loop()에서
+//  "현재 씬 퇴장(2초) → 목표 씬 등장" 순서로 진행된다(크로스페이드 아님).
+//  [주의] syncPanel()이 sceneTarget을 읽으므로 그 정의보다 먼저 선언해야 한다
+//  (let은 호이스팅돼도 초기화 전 접근이 TDZ 에러가 난다).
+const SCENES = ['cube', 'ether', 'harp'];
+let scene = 'cube';          // 지금 화면에 있는(또는 등장 중인) 씬
+let sceneTarget = 'cube';    // 가고 싶은 씬
+
+// ---- 패널: 스텝/경계를 실시간으로 바꿔 비교 ----
+const DEFAULTS = { steps: 37, edge: 0.19, density: 0.12, uniform: false, shape: 0.14,
+                   scale: 1.0, stretchX: 0.85, stretchY: 1.0, ether: 0, hueShift: 0,
+                   harp: 0, harpCount: 120, harpThick: 1.35, harpSpread: 1.15, harpTurn: 1.0,
+                   etherVol: true };
+//  START 누르기 전 상태: 완전한 구가 빠르게 자전한다.
+//  START 누르기 전 구: 경계 두께 1.6, 크기 1.7.
+const INTRO = { steps: 37, edge: 1.6, density: 0.12, uniform: false, shape: 1.0,
+                scale: 1.7, stretchX: 1.0, stretchY: 1.0, ether: 0, hueShift: 0,
+                harp: 0, harpCount: 120, harpThick: 1.35, harpSpread: 1.15, harpTurn: 1.0,
+                   etherVol: true };
+const P = { ...INTRO };          // 시작 화면 값으로 출발
+
+//  인트로 → 기본값 전환(3초). 0 = 인트로, 1 = 완전히 기본값.
+let started = false;
+let introT  = 0;
+const INTRO_SEC = 3.5;
+//  인트로 자전: 초당 2.3바퀴 = 2.3 * 2π rad/s.
+const INTRO_SPIN = 2.3 * Math.PI * 2.0;
+let introSpin = 0;
+//  색: uHue=-56.46 은 기본 팔레트(palFreq 30.234) 상태에서도 모든 깊이가
+//   225~254°(파랑)에 머문다. 인트로와 랜딩 후가 같은 값이므로 전환 중에도
+//   색상환을 훑지 않는다 → 온갖 색이 스쳐 지나가는 문제가 원천적으로 없다.
+//  [변경] 파랑은 이제 uBlueTint가 만든다. 색 오프셋은 큐브 본래 색을 위해
+//  0으로 되돌린다(-29.5는 저주파 시절 값으로, 지금은 큐브를 단색 파랑으로 만든다).
+const INTRO_HUE = 0.0;
+//  인트로 파랑 틴트: 1(완전 파랑) → 0(팔레트 원색). 팔레트 입력은 건드리지 않는다.
+//  깊이에 따른 색상 변화 빈도.
+//   기본 30.234는 광선이 도형을 지나며 색상환을 3.85바퀴 돈다 → 스텝당 37°씩 튄다.
+//   큐브는 실루엣·무늬가 가려주지만 매끈한 구에서는 회전할 때 색이 번쩍인다.
+let hueOffset = INTRO_HUE;
+const $ = id => document.getElementById(id);
+function syncPanel(){
+  $('sSteps').value = P.steps;      $('vSteps').textContent   = P.steps;
+  $('sEdge').value = P.edge;        $('vEdge').textContent    = P.edge.toFixed(2);
+  $('sDensity').value = P.density;  $('vDensity').textContent = P.density.toFixed(3);
+  $('sShape').value = P.shape;      $('vShape').textContent   = P.shape.toFixed(2);
+  $('sScale').value = P.scale;      $('vScale').textContent   = P.scale.toFixed(2);
+  $('sStretchX').value = P.stretchX; $('vStretchX').textContent = P.stretchX.toFixed(2);
+  $('sStretchY').value = P.stretchY; $('vStretchY').textContent = P.stretchY.toFixed(2);
+  $('sHueShift').value = P.hueShift; $('vHueShift').textContent = P.hueShift + '\u00B0';
+  $('cUniform').checked = P.uniform;
+  $('cEtherVol').checked = !!P.etherVol;
+  $('sHarpCount').value = P.harpCount;   $('vHarpCount').textContent  = P.harpCount;
+  $('sHarpThick').value = P.harpThick;   $('vHarpThick').textContent  = P.harpThick.toFixed(2);
+  $('sHarpSpread').value= P.harpSpread;  $('vHarpSpread').textContent = P.harpSpread.toFixed(2);
+  $('sHarpTurn').value  = P.harpTurn;    $('vHarpTurn').textContent   = P.harpTurn.toFixed(2);
+  document.body.classList.toggle('harp', sceneTarget === 'harp');
+  for(const [id, name] of [['bSceneCube','cube'],['bSceneEther','ether'],['bSceneHarp','harp']])
+    $(id).classList.toggle('on', sceneTarget === name);
+}
+$('sSteps').addEventListener('input', e=>{ P.steps = +e.target.value; syncPanel(); });
+$('sEdge').addEventListener('input', e=>{ P.edge = +e.target.value; syncPanel(); });
+$('sDensity').addEventListener('input', e=>{ P.density = +e.target.value; syncPanel(); });
+$('cUniform').addEventListener('change', e=>{ P.uniform = e.target.checked; });
+//  유기체 렌더 방식 전환. 켜면 큐브·하프와 같은 볼류메트릭 누적(미학 통일),
+//  끄면 원본 Ether의 발광 렌더러.
+$('cEtherVol').addEventListener('change', e=>{ P.etherVol = e.target.checked; });
+$('sShape').addEventListener('input', e=>{ P.shape = +e.target.value; syncPanel(); });
+$('sScale').addEventListener('input', e=>{ P.scale = +e.target.value; syncPanel(); });
+$('sHueShift').addEventListener('input', e=>{ P.hueShift = +e.target.value; syncPanel(); });
+// ---- 씬 전환 버튼 ----
+function goScene(next){
+  if(next === sceneTarget) return;
+  sceneTarget = next;
+  syncPanel();
+}
+$('bSceneCube').addEventListener('click',  ()=> goScene('cube'));
+$('bSceneEther').addEventListener('click', ()=> goScene('ether'));
+$('bSceneHarp').addEventListener('click',  ()=> goScene('harp'));
+$('sHarpCount').addEventListener('input',  e=>{ P.harpCount  = +e.target.value; syncPanel(); });
+$('sHarpThick').addEventListener('input',  e=>{ P.harpThick  = +e.target.value; syncPanel(); });
+$('sHarpSpread').addEventListener('input', e=>{ P.harpSpread = +e.target.value; syncPanel(); });
+$('sHarpTurn').addEventListener('input',   e=>{ P.harpTurn   = +e.target.value; syncPanel(); });
+// ---- 씬별 기본값 ----
+//  세 씬은 슬라이더를 공유하지만 적정값이 전혀 다르다(밀도는 10배 이상 차이).
+//  씬을 옮길 때마다 여기 값으로 슬라이더를 갈아끼우고, 사용자가 만진 값은
+//  그 씬을 떠날 때 기억해 뒀다가 돌아오면 되살린다.
+const SCENE_DEFAULTS = {
+  cube:  { density: 0.12, edge: 0.19, steps: 37, hueShift:    0 },
+  ether: { density: 0.10, edge: 0.19, steps: 26, hueShift:  131 },  // 화질 우선(20보다 띠가 덜 보임)
+  harp:  { density: 1.60, edge: 0.30, steps: 37, hueShift:  115 },  // 하프는 스텝을 안 쓴다(픽셀당 1회)
+};
+//  [색조 전환] 씬을 옮길 때 색조는 슬라이더처럼 즉시 갈아끼우지 않고 2초에 걸쳐
+//   목표값으로 흐른다. 실제 그려지는 값은 hueShiftShown이고, P.hueShift는 목표.
+//  [3초] 등장(1.8초)보다 길게 잡아, 씬이 다 나타난 뒤에도 색이 1.2초 더 흐른다.
+const HUE_TWEEN_SEC = 3.0;
+let hueShiftShown = 0;
+//  트윈 상태: 시작값·목표값·경과. 지수 접근(diff*k)은 2초에 89%까지만 가고
+//  꼬리가 길게 남는다 → 시간 기반으로 계산해 정확히 2초에 도달시킨다.
+let hueFrom = 0, hueTo = 0, hueT = 1;
+//  [인트로] 구→큐브 이행 동안만 72°를 유지하다가, 착지 후 2초에 걸쳐 0으로 돌아온다.
+const INTRO_HUE_SHIFT = 72;
+let introHueDone = false;   // 착지 후 색조 복귀가 시작됐는지
+//  씬별로 사용자가 마지막에 쓰던 값(없으면 기본값으로 출발).
+const sceneSaved = {
+  cube:  { ...SCENE_DEFAULTS.cube },
+  ether: { ...SCENE_DEFAULTS.ether },
+  harp:  { ...SCENE_DEFAULTS.harp },
+};
+function applySceneEdge(from, to){
+  if(from === to) return;
+  //  떠나는 씬의 현재 값을 보관.
+  if(sceneSaved[from]){
+    sceneSaved[from].density  = P.density;
+    sceneSaved[from].edge     = P.edge;
+    sceneSaved[from].steps    = P.steps;
+    sceneSaved[from].hueShift = P.hueShift;
+  }
+  //  도착 씬의 값으로 교체. 색조는 목표만 바꾸고 실제 값은 2초에 걸쳐 따라간다.
+  const t = sceneSaved[to];
+  if(t){ P.density = t.density; P.edge = t.edge; P.steps = t.steps; P.hueShift = t.hueShift; }
+  syncPanel();     // 슬라이더 표시도 함께 갱신
+}
+$('sStretchX').addEventListener('input', e=>{ P.stretchX = +e.target.value; syncPanel(); });
+$('sStretchY').addEventListener('input', e=>{ P.stretchY = +e.target.value; syncPanel(); });
+// 화면비에 맞춰 가로세로를 채우는 값으로 한 번에 세팅.
+$('bFill').addEventListener('click', ()=>{
+  //  회전 때문에 모서리가 화면 안으로 들어올 수 있어 넉넉하게 잡는다.
+  const aspect = innerWidth / innerHeight;
+  P.scale = 2.2;
+  P.stretchX = Math.max(1.0, aspect) * 1.45;   // 가로가 넓으면 그만큼 더 늘인다
+  P.stretchY = Math.max(1.0, 1/aspect) * 1.45;
+  syncPanel();
+});
+$('bReset').addEventListener('click', ()=>{ Object.assign(P, DEFAULTS); syncPanel(); });
+
+// START: 인트로(완전한 구·고속 자전) → 기본값으로 3초간 완만하게 전환.
+$('startBtn').addEventListener('click', ()=>{
+  if(started) return;
+  started = true;
+  Object.assign(P, DEFAULTS);      // 목표값 = 기본 설정
+  //  [인트로 색조] 구→큐브 이행 동안은 72°를 유지한다(착지 후 0으로 복귀).
+  P.hueShift = INTRO_HUE_SHIFT;
+  hueShiftShown = INTRO_HUE_SHIFT;
+  sceneSaved.cube.hueShift = INTRO_HUE_SHIFT;
+  syncPanel();
+  document.body.classList.add('started');
+  //  shape 스무딩 변수도 인트로의 구(1.0)에서 출발시켜야 튀지 않는다.
+  shape = 1.0;
+  //  인트로 동안 쌓였을 수 있는 값을 정리 — START 직후 갑자기 돌지 않게.
+  spinVel.x = spinVel.y = 0;
+  lastCss = null;                  // 다음 이동부터 delta를 새로 잰다
+});
+// 패널 위에서는 마우스 회전이 걸리지 않게(슬라이더 조작 방해 방지)
+$('panel').addEventListener('pointermove', e=> e.stopPropagation());
+syncPanel();
+
+// 렌더 해상도 배율. DPR을 그대로 쓰지 않고 상한을 올려 선명도 확보.
+let DPR = Math.min(devicePixelRatio||1, 2);
+function resize(){
+  // 상한 3: 레티나에서 2를 넘겨 렌더하면 링 가장자리가 눈에 띄게 매끈해진다.
+  DPR = Math.min((devicePixelRatio||1) * 1.5, 3);
+  canvas.width=innerWidth*DPR; canvas.height=innerHeight*DPR;
+  canvas.style.width=innerWidth+'px'; canvas.style.height=innerHeight+'px';
+  gl.viewport(0,0,canvas.width,canvas.height);
+}
+addEventListener('resize', resize); resize();
+
+// CSS px → 셰이더 uv 좌표계 (uv = (px*2 - res)/res.y). 마우스 중심 이동용.
+function toShaderXY(cssX, cssY){
+  const W=canvas.width, H=canvas.height;
+  const px=cssX*DPR, py=cssY*DPR;
+  return [ (px*2-W)/H, -(py*2-H)/H ];   // y축 종횡비 보정(res.y로 나눔)
+}
+
+// 마우스 이동량(delta)을 회전 속도로 쓴다 — "움직인 방향으로 도형이 돈다".
+let lastCss = null;
+let spinVel = { x: 0, y: 0 };      // 회전 각속도(rad/s)
+addEventListener('pointermove', e=>{
+  // 패널 조작 중에는 회전시키지 않는다.
+  if(e.target.closest && e.target.closest('#panel')){ lastCss = null; return; }
+  //  START 전에는 마우스 회전을 반영하지 않는다(인트로 자전만 보이도록).
+  //   위치 추적(mouseTarget)은 계속해서, START 직후 글로우가 튀지 않게 한다.
+  if(started && lastCss){
+    // CSS px → 화면 비율. 가로 이동 = yaw(xz), 세로 이동 = pitch(xy).
+    //  [부호] 화면 좌표는 아래로 갈수록 clientY가 커지는데, 셰이더의 rot()은
+    //  위쪽이 +y인 수학 좌표계다. dy를 그대로 쓰면 세로 회전만 반대로 돈다
+    //  (마우스를 내리면 도형 윗면이 앞으로 넘어옴). 부호를 뒤집어 맞춘다.
+    //  가로(dx)는 두 좌표계의 방향이 같아 그대로 둔다.
+    const dx = (e.clientX - lastCss.x) / innerHeight;
+    const dy = -(e.clientY - lastCss.y) / innerHeight;
+    const GAIN = 9.0;
+    spinVel.x += dx * GAIN;
+    spinVel.y += dy * GAIN;
+  }
+  lastCss = { x: e.clientX, y: e.clientY };
+  // 절대 위치도 따로 저장(글로우·형태 끌림용). 셰이더 좌표로 환산.
+  mouseTarget.x =  (e.clientX - innerWidth*0.5)  / innerHeight;
+  mouseTarget.y = -(e.clientY - innerHeight*0.5) / innerHeight;
+  pullTarget = 1;                     // 마우스가 움직이는 동안엔 인력 on
+});
+
+let spin = { x: 0.6, y: 0.3 };     // 누적 회전각(정지 시에도 살짝 기울어진 상태)
+//  [손 조작] 손 위치가 만드는 목표 회전각과, 그 기준이 되는 누적 자전각.
+let spinTarget = { x: 0, y: 0 };
+let spinBase   = { x: 0.6, y: 0.3 };
+let hue  = 0;                      // 색 위상
+let shape = 1.0;                   // 0=큐브 1=구. 인트로는 완전한 구에서 출발
+let ether = 0;                     // 0=원래 도형 1=유기적. 느리게 따라간다
+//  씬 전환 시퀀서. seqPhase: 0=정지, 1=퇴장 중, 2=등장 중. seqT = 그 구간 진행률.
+let seqPhase = 0, seqT = 0;
+//  하프 전환용 상태(셰이더로 그대로 넘어간다).
+let harpZoom = 1, harpGap = 1, harpSpin = 0, harpFade = 1;
+let exitSpin = 0;                  // 퇴장 시 큐브에 더해지는 추가 회전각
+let writhe = 0;                    // 유기적 도형 퇴장 시 꿈틀거림 세기
+let etherZoom = 1;                 // 유기적 도형 배율(등장/퇴장 시 변함)
+let mouseTarget = { x: 0, y: 0 };  // 마우스 절대 위치(셰이더 좌표)
+let mousePos    = { x: 0, y: 0 };  // 부드럽게 따라가는 실제 적용값
+//  하프 인력용: 회전보다 더 느긋하게 따라와야 판이 "끌려오는" 느낌이 난다.
+//  세기(pullK)는 마우스가 창을 벗어나면 0으로 빠지며 판이 제자리로 돌아간다.
+let harpPullX = 0;
+let pullK = 0, pullTarget = 0;
+//  [양손] 두 번째 인력 중심(오른손). 마우스만 쓸 땐 세기 0으로 꺼둔다.
+let harpPullX2 = 0, pullK2 = 0;
+//  [유기체] 글로우 중심(왼손). 손이 없으면 마우스를 따른다.
+let glowPos = { x: 0, y: 0 };
+//  [유기체] 형태 변형 중심(오른손) — 셰이더의 uMouse가 이 역할을 한다.
+
+// ================== 손 추적 (MediaPipe Hands) ==================
+//  presence_session.html에서 검증된 설정을 그대로 가져온다.
+//  좌표계: 셰이더 uv와 맞춘다(화면 중앙 = 0,0, y는 위가 +).
+//  [거울 보정] MediaPipe의 'Left'/'Right'는 카메라 시점이라, 사용자가 보기엔 반대다.
+//   웹캠 영상은 거울처럼 보이므로 label을 뒤집고 x도 (1-x)로 뒤집는다.
+class OneEuro {
+  constructor(minCut=3.5, beta=0.05){ this.minCut=minCut; this.beta=beta; this.x=null; this.dx=0; this.t=null; }
+  _a(c,dt){ const tau=1/(2*Math.PI*c); return 1/(1+tau/dt); }
+  filter(x,t){
+    if(this.t==null){ this.t=t; this.x=x; return x; }
+    let dt=(t-this.t)/1000; if(dt<=0) dt=1/120;
+    const dx=(x-this.x)/dt, aD=this._a(1.0,dt);
+    this.dx=aD*dx+(1-aD)*this.dx;
+    const cut=this.minCut+this.beta*Math.abs(this.dx), a=this._a(cut,dt);
+    this.x=a*x+(1-a)*this.x; this.t=t; return this.x;
+  }
+}
+//  손별 상태. pos = 셰이더 좌표, vel = 프레임간 이동량(회전 입력용).
+//  손 이동 감도. 1 = 카메라 화각 그대로(둔함).
+//  3.4면 화각의 약 절반만 움직여도 화면 가로 끝까지 닿는다(16:10 기준).
+//  큐브 회전은 "이동량"을 쓰는데 감도가 이미 좋다고 해서, 아래 HGAIN에서
+//  이 값을 나눠 상쇄한다 — 즉 이 상수는 유기체·하프의 위치 감도만 바꾼다.
+const HAND_GAIN = 3.4;
+//  유기체 전용 추가 감도. 형체가 중앙에 모여 있어 같은 이동이 덜 도드라진다.
+const ETHER_EXTRA_GAIN = 0.68;
+//  w = 존재 가중치(0~1). 손이 나타나면 0→1, 사라지면 1→0으로 서서히 변한다.
+//  이 값으로 위치를 섞기 때문에 손이 갑자기 생기거나 없어져도 장면이 튀지 않는다.
+const HAND = {
+  Left:  { on:false, x:0, y:0, px:null, py:null, vx:0, vy:0, fx:new OneEuro(), fy:new OneEuro(), lost:0, w:0, fresh:true },
+  Right: { on:false, x:0, y:0, px:null, py:null, vx:0, vy:0, fx:new OneEuro(), fy:new OneEuro(), lost:0, w:0, fresh:true },
+};
+//  손이 나타나고/사라지는 데 걸리는 시간(초). 길수록 부드럽지만 반응이 늦다.
+const HAND_FADE_SEC = 0.55;
+let handsReady = false;      // 손이 한 번이라도 잡혔는가(마우스 폴백 해제용)
+let camDenied  = false;
+
+function onHands(res){
+  const now = performance.now();
+  const seen = { Left:false, Right:false };
+  if(res.multiHandLandmarks && res.multiHandedness){
+    res.multiHandLandmarks.forEach((lm, i)=>{
+      const raw = res.multiHandedness[i].label;        // 카메라 시점
+      const label = raw === 'Left' ? 'Right' : 'Left'; // 거울 보정
+      const H = HAND[label];
+      if(!H) return;
+      //  손바닥 중심(손목 0 + 중지 밑동 9). x는 거울이라 뒤집는다.
+      //  화면 비율에 맞춰 셰이더 uv로: x는 종횡비 보정, y는 위가 +.
+      const aspect = innerWidth / innerHeight;
+      const nx = (1 - (lm[0].x + lm[9].x)/2) - 0.5;    // -0.5 ~ +0.5
+      const ny = 0.5 - (lm[0].y + lm[9].y)/2;
+      //  [감도] 손을 카메라 화각 끝까지 뻗어야 화면 끝에 닿는 건 너무 둔하다.
+      //   실제로 손이 편하게 오가는 범위는 화면 중앙 절반 정도이므로, 그 구간을
+      //   화면 전체로 늘린다(HAND_GAIN).
+      //   [주의] clamp를 좁게 걸면 화면 가장자리에서 값이 포화돼 손을 더 움직여도
+      //   아무 반응이 없다(회전 입력은 "이동량"이라 아예 0이 된다). 화면 밖까지
+      //   여유를 두고 자른다 — 어차피 화면 밖은 안 보이므로 문제되지 않는다.
+      const LIM = 1.6;
+      const gx = Math.max(-LIM, Math.min(LIM, nx * HAND_GAIN));
+      const gy = Math.max(-LIM, Math.min(LIM, ny * HAND_GAIN));
+      //  [재등장] 필터에 이전 손 위치가 남아 있으면 새 위치로 확 끌려가며 튄다.
+      //   새로 잡힌 손은 필터를 그 자리에서 다시 시작한다.
+      if(H.fresh){
+        H.fx = new OneEuro(); H.fy = new OneEuro(); H.fresh = false;
+        //  [재등장] 사라지기 전 위치(H.x)에서 출발시킨다. 새 위치에서 바로
+        //   시작하면 w가 차오르는 동안 가중 평균이 그 지점으로 확 끌려간다.
+        //   여기서 이어 붙이면 "이전 자리에서 새 자리로 흘러가는" 모양이 된다.
+        H.fx.x = H.x; H.fx.t = now;
+        H.fy.x = H.y; H.fy.t = now;
+      }
+      const sx = H.fx.filter(gx * aspect, now);
+      const sy = H.fy.filter(gy, now);
+      //  프레임간 이동량(회전 입력). 큰 점프는 재획득으로 보고 버린다.
+      if(H.px != null){
+        const dx = sx - H.px, dy = sy - H.py;
+        if(Math.abs(dx) < 0.25 && Math.abs(dy) < 0.25){ H.vx = dx; H.vy = dy; }
+        else { H.vx = 0; H.vy = 0; }
+      }
+      H.px = sx; H.py = sy;
+      H.x = sx; H.y = sy;
+      H.on = true; H.lost = 0;
+      seen[label] = true;
+    });
+  }
+  for(const k of ['Left','Right']){
+    if(!seen[k]){
+      const H = HAND[k];
+      H.vx = 0; H.vy = 0;
+      //  몇 프레임 놓쳐도 바로 꺼지지 않게(깜빡임 방지).
+      if(H.on && ++H.lost > 8){
+        H.on = false; H.px = null; H.py = null;
+        H.fresh = true;              // 다음에 잡히면 필터를 새로 시작
+        //  x/y는 마지막 위치를 그대로 남겨 둔다 — w가 0으로 빠지는 동안
+        //  그 위치에서 부드럽게 빠져나가야 하기 때문(0으로 지우면 튄다).
+      }
+    }
+  }
+  if((HAND.Left.on || HAND.Right.on) && !handsReady){
+    handsReady = true;
+    document.body.classList.add('handson');
+  }
+}
+
+async function initHands(){
+  const video = document.getElementById('cam');
+  try{
+    if(typeof Hands === 'undefined' || typeof Camera === 'undefined') throw new Error('라이브러리 로드 실패');
+    const hands = new Hands({ locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({ maxNumHands:2, modelComplexity:1,
+                       minDetectionConfidence:0.6, minTrackingConfidence:0.6 });
+    hands.onResults(onHands);
+    const cam = new Camera(video, {
+      onFrame: async ()=>{ await hands.send({ image: video }); },
+      width: 1280, height: 720
+    });
+    await cam.start();
+    document.getElementById('camHint').textContent = '두 손을 화면에 보여주세요';
+  }catch(err){
+    camDenied = true;
+    document.getElementById('camHint').textContent = '카메라를 쓸 수 없어 마우스로 조작합니다';
+    setTimeout(()=>document.body.classList.add('handson'), 2600);
+  }
+}
+initHands();
+
+const t0 = performance.now();
+let prev = 0;
+function loop(now){
+  const dt = prev ? Math.min((now-prev)/1000, 0.05) : 0.016; prev=now;
+
+  // ---- 손 입력 → 씬별 매핑 ----
+  //  [존재 가중치] 손이 나타나면 0→1, 사라지면 1→0으로 서서히 이동한다.
+  //   아래 모든 계산은 이 가중치로 섞으므로, 손이 갑자기 생기거나 없어져도
+  //   위치가 순간이동하지 않고 부드럽게 흘러 들어오고 빠져나간다.
+  for(const k of ['Left','Right']){
+    const H = HAND[k];
+    const tw = H.on ? 1 : 0;
+    H.w += (tw - H.w) * Math.min(1, dt / HAND_FADE_SEC * 2.4);
+    if(Math.abs(H.w - tw) < 0.002) H.w = tw;
+  }
+  const wSum = HAND.Left.w + HAND.Right.w;
+
+  //  [큐브 회전] 손의 "위치"가 곧 회전각이다(이동량이 아니라).
+  //   · 손 하나 → 그 손의 x가 x축 회전, y가 y축 회전
+  //   · 손 둘   → 두 손의 평균 (가중치로 섞이므로 개수가 바뀌어도 연속적)
+  //   손을 그 자리에 두면 큐브도 그 각도에 머문다(관성으로 흘러가지 않는다).
+  const handRot = started && handsReady && wSum > 0.001;
+  if(handRot){
+    //  가중 평균: 사라지는 손은 영향력이 서서히 줄고, 나타나는 손은 서서히 는다.
+    const hx = (HAND.Left.x * HAND.Left.w + HAND.Right.x * HAND.Right.w) / wSum;
+    const hy = (HAND.Left.y * HAND.Left.w + HAND.Right.y * HAND.Right.w) / wSum;
+    //  화면 좌표(대략 ±1.3) → 회전각. 화면 끝에서 약 ±1바퀴 남짓 돌도록.
+    const ROT_RANGE = 1.3;
+    spinTarget.x = hx * ROT_RANGE;
+    spinTarget.y = hy * ROT_RANGE;
+    //  목표각으로 부드럽게 수렴(손 떨림이 그대로 각도에 실리지 않게).
+    //  손이 막 나타났을 때는 wSum이 작아 수렴도 느리다 → 급격한 회전 방지.
+    const k = Math.min(1, 6.0 * dt * Math.min(1, wSum));
+    spin.x += (spinTarget.x + spinBase.x - spin.x) * k;
+    spin.y += (spinTarget.y + spinBase.y - spin.y) * k;
+    //  손으로 잡고 있는 동안엔 마우스 관성이 끼어들지 않게 죽인다.
+    spinVel.x = 0; spinVel.y = 0;
+  }
+
+  // 관성: 손을 떼면 서서히 멈춘다(프레임레이트 독립 감쇠).
+  const decay = Math.exp(-2.6 * dt);
+  spinVel.x *= decay;
+  spinVel.y *= decay;
+
+  // 기본 성격: 가만히 둬도 아주 천천히 자전한다(마우스는 여기에 얹히는 가속).
+  //  x/y 속도를 무리수 비로 두면 같은 각도로 돌아오지 않아 패턴이 반복돼 보이지 않는다.
+  const IDLE_X = 0.055, IDLE_Y = 0.021;
+  //  [손 조작 중] 위 블록이 각도를 직접 정하므로 여기서 또 적분하면 안 된다.
+  //   대신 기본 자전만 spinBase에 쌓아 두고, 손을 놓으면 그 값에서 이어간다.
+  spinBase.x += IDLE_X * dt;
+  spinBase.y += IDLE_Y * dt;
+  if(!handRot){
+    spin.x += (spinVel.x + IDLE_X) * dt;
+    spin.y += (spinVel.y + IDLE_Y) * dt;
+    //  손을 놓은 시점의 각도를 기준으로 삼아, 다시 잡을 때 튀지 않게 한다.
+    spinBase.x = spin.x - spinTarget.x;
+    spinBase.y = spin.y - spinTarget.y;
+  }
+
+  // 색: 가만히 두면 아주 느리게, 빠르게 움직일수록 빨리 흐른다.
+  //  [주의] 손으로 조작할 때는 위에서 spinVel을 0으로 죽이므로, 그 값만 보면
+  //   손을 아무리 움직여도 색이 안 변한다. 손 이동 속도를 따로 재서 쓴다.
+  //   (마우스일 때는 기존대로 spinVel이 속도 노릇을 한다.)
+  let handSpeed = 0;
+  if(handsReady){
+    //  vx/vy는 프레임간 이동량 → dt로 나눠 초당 속도로 환산.
+    for(const k of ['Left','Right']){
+      const H = HAND[k];
+      if(H.w > 0.001) handSpeed = Math.max(handSpeed, Math.hypot(H.vx, H.vy) / Math.max(dt, 1e-3) * H.w);
+    }
+  }
+  const speed = Math.max(Math.hypot(spinVel.x, spinVel.y), handSpeed * 1.0);
+  hue += (0.10 + speed * 0.55) * dt;
+
+  // 큐브↔구: 슬라이더 값을 부드럽게 따라간다(급격히 끌어도 형태가 튀지 않게).
+  //  SDF를 섞는 방식이라 0~1 사이 어떤 값도 유효한 중간 형태가 된다.
+  shape += (P.shape - shape) * Math.min(1, 9.0 * dt);
+  // 유기적 변모는 일부러 느리게(1.1) — '자연스럽게 변모'하는 인상을 위해.
+  // ---- 씬 전환 (큐브 / 유기체 / 하프) ----
+  //  크로스페이드가 아니라 순차 진행이다:
+  //    [퇴장 2초] 현재 씬이 회전·확대하며 사라짐 → [등장 1.8초] 목표 씬이 나타남
+  //  두 구간은 절대 겹치지 않는다. 투명도는 각 구간의 "끝/시작 0.7초"에만 움직인다.
+  const EXIT_SEC = 2.0, ENTER_SEC = 1.8, FADE_SEC = 0.7;
+
+  if(sceneTarget !== scene && seqPhase === 0){
+    seqPhase = 1;                 // 퇴장 시작
+    seqT = 0;
+  }
+  if(seqPhase === 1){
+    seqT += dt / EXIT_SEC;
+    if(seqT >= 1){
+      //  퇴장 완료 → 씬을 바꾸고 등장 시작.
+      applySceneEdge(scene, sceneTarget);
+      scene = sceneTarget;
+      seqPhase = 2; seqT = 0;
+    }
+  }else if(seqPhase === 2){
+    seqT += dt / ENTER_SEC;
+    if(seqT >= 1){ seqPhase = 0; seqT = 0; }
+  }
+
+  //  진행률: exitU = 퇴장 진행(0→1), enterU = 등장 진행(0→1)
+  const exitU  = (seqPhase === 1) ? Math.min(seqT, 1) : 0;
+  const enterU = (seqPhase === 2) ? Math.min(seqT, 1) : 1;
+
+  //  이징. 퇴장은 "완만히 시작해 빠르게"(ease-in), 등장은 "빠르게 시작해 완만히"(ease-out).
+  const easeIn  = t => t*t*t;
+  const easeOut = t => 1.0 - Math.pow(1.0 - t, 3.0);
+  //  투명도: 퇴장은 마지막 0.7초, 등장은 처음 0.7초에만 선형으로 움직인다.
+  const exitFadeStart = 1.0 - FADE_SEC / EXIT_SEC;
+  const fadeOut = (seqPhase === 1)
+    ? 1.0 - Math.max(0, (exitU - exitFadeStart) / (1.0 - exitFadeStart)) : 1.0;
+  const fadeIn  = (seqPhase === 2)
+    ? Math.min(1, enterU / (FADE_SEC / ENTER_SEC)) : 1.0;
+  //  화면에 보이는 씬의 알파. 퇴장 중이면 사라지는 쪽, 등장 중이면 나타나는 쪽.
+  const sceneFade = (seqPhase === 1) ? fadeOut : fadeIn;
+
+  //  "지금 그려야 할 씬"은 퇴장 중이면 아직 이전 씬이다.
+  const drawScene = scene;
+
+  //  전환 진행률 k: 퇴장이면 0→1(멀어짐), 등장이면 1→0(제자리로).
+  //   퇴장은 ease-in(완만→빠름), 등장은 역방향 입력이라 같은 ease-in을 쓰면
+  //   "빠르게 → 완만히 안착"이 된다(기존 큐브 전환과 동일한 원리).
+  const trK = (seqPhase === 1) ? easeIn(exitU)
+            : (seqPhase === 2) ? easeIn(1.0 - enterU) : 0;
+
+  //  ---- 큐브 ----
+  const CUBE_ZOOM_MAX = 3.6;
+  const EXIT_SPIN_MAX = 0.98 * Math.PI * 2.0;     // 초당 0.98바퀴 (1.4에서 30% 감속)
+  //  회전 속도: 퇴장은 급가속 후 완만히 꺾임(√), 등장은 끝에서 완만히 0으로(제곱).
+  let cubeSpinVel = 0;
+  if(drawScene === 'cube'){
+    if(seqPhase === 1)      cubeSpinVel = Math.sqrt(exitU) * EXIT_SPIN_MAX;
+    else if(seqPhase === 2) cubeSpinVel = Math.pow(1.0 - enterU, 2) * EXIT_SPIN_MAX;
+  }
+  exitSpin += cubeSpinVel * dt;
+  const cubeZoom = 1.0 + (CUBE_ZOOM_MAX/Math.max(P.scale,1e-3) - 1.0) * trK;
+
+  //  ---- 유기체 ----
+  const ETHER_ZOOM_MAX = 3.6;
+  ether = (drawScene === 'ether') ? sceneFade : 0;
+  etherZoom = 1.0 + (ETHER_ZOOM_MAX - 1.0) * trK;
+  //  꿈틀: 퇴장은 급가속 후 완만히(√), 등장은 도착할수록 잦아듦(제곱).
+  writhe = (drawScene !== 'ether') ? 0
+         : (seqPhase === 1) ? Math.sqrt(exitU)
+         : (seqPhase === 2) ? Math.pow(1.0 - enterU, 2) : 0;
+
+  //  ---- 하프 ----
+  //  중앙으로 확대 + 판마다 회전 + 간격 벌어짐. 등장은 그 반대(간격이 좁혀지고
+  //  직육면체가 작아지며 제자리로).
+  const HARP_ZOOM_MAX = 3.2, HARP_GAP_MAX = 4.5, HARP_SPIN_MAX = 2.6;
+  harpZoom = 1.0 + (HARP_ZOOM_MAX - 1.0) * trK;
+  harpGap  = 1.0 + (HARP_GAP_MAX  - 1.0) * trK;
+  //  회전각은 누적이 아니라 진행률에 비례(전환이 끝나면 정확히 0으로 돌아온다).
+  harpSpin = HARP_SPIN_MAX * trK;
+  harpFade = (drawScene === 'harp') ? sceneFade : 0;
+
+  // ---- 입력 소스 결정: 손이 잡히면 손, 아니면 마우스 ----
+  //  [유기체] 발광과 변형을 손마다 나누지 않고 "하나의 지점"이 담당한다
+  //   (마우스 하나로 조작하던 것과 같은 감각).
+  //   · 손 하나 → 그 손을 따라감
+  //   · 손 둘   → 두 손의 평균 위치
+  //  하프만 양손을 각각 인력 중심으로 쓴다.
+  const useHands = handsReady && wSum > 0.001;
+  let handAvgX = 0, handAvgY = 0;
+  if(useHands){
+    //  가중 평균 — 손 개수가 바뀌는 순간에도 값이 연속적으로 이어진다.
+    handAvgX = (HAND.Left.x * HAND.Left.w + HAND.Right.x * HAND.Right.w) / wSum;
+    handAvgY = (HAND.Left.y * HAND.Left.w + HAND.Right.y * HAND.Right.w) / wSum;
+    //  [민감도] 유기체는 형체가 화면 중앙에 모여 있어 조금 더 예민해야
+    //  움직임이 눈에 띈다. 손 좌표에 이미 HAND_GAIN이 걸려 있고 여기에 더 얹는다.
+    handAvgX *= ETHER_EXTRA_GAIN;
+    handAvgY *= ETHER_EXTRA_GAIN;
+  }
+  //  변형·글로우 모두 같은 지점을 따른다.
+  const shapeTx = useHands ? handAvgX : mouseTarget.x;
+  const shapeTy = useHands ? handAvgY : mouseTarget.y;
+  const glowTx  = shapeTx, glowTy = shapeTy;
+
+  // 글로우가 목표를 부드럽게 뒤따르도록(즉각 붙으면 딱딱해 보인다).
+  mousePos.x += (shapeTx - mousePos.x) * Math.min(1, 4.0 * dt);
+  mousePos.y += (shapeTy - mousePos.y) * Math.min(1, 4.0 * dt);
+  glowPos.x  += (glowTx  - glowPos.x)  * Math.min(1, 4.0 * dt);
+  glowPos.y  += (glowTy  - glowPos.y)  * Math.min(1, 4.0 * dt);
+
+  //  하프 인력: 손이 있으면 왼손/오른손 각각, 없으면 마우스 하나만.
+  //  손이 사라져도 마지막 위치를 유지한다(위치는 그대로, 세기만 빠진다).
+  const p1x = useHands ? (HAND.Left.w  > 0.001 ? HAND.Left.x  : harpPullX)  : mouseTarget.x;
+  const p2x = useHands ? (HAND.Right.w > 0.001 ? HAND.Right.x : harpPullX2) : 0;
+  //  인력 중심은 더 느리게(2.2/s) 따라온다 → 판이 늦게 끌려왔다가 늦게 놓인다.
+  harpPullX  += (p1x - harpPullX)  * Math.min(1, 2.2 * dt);
+  harpPullX2 += (p2x - harpPullX2) * Math.min(1, 2.2 * dt);
+  //  세기도 부드럽게. 손이 사라지거나 창을 벗어나면 0 → 판이 서서히 제자리로.
+  //  인력 세기도 존재 가중치를 그대로 쓴다 → 손이 사라져도 판이 서서히 놓인다.
+  const k1 = useHands ? HAND.Left.w  : pullTarget;
+  const k2 = useHands ? HAND.Right.w : 0;
+  pullK  += (k1 - pullK)  * Math.min(1, 2.6 * dt);
+  pullK2 += (k2 - pullK2) * Math.min(1, 2.6 * dt);
+
+  // ---- 색조 전환 ----
+  //  씬 전환·인트로 복귀 모두 2초에 걸쳐 목표값으로 흐른다.
+  //  [인트로] 착지(introT=1)가 끝나면 그때부터 큐브 기본값 0°로 되돌린다.
+  if(started && introT >= 1 && !introHueDone){
+    introHueDone = true;
+    P.hueShift = SCENE_DEFAULTS.cube.hueShift;   // 0
+    sceneSaved.cube.hueShift = SCENE_DEFAULTS.cube.hueShift;
+    syncPanel();
+  }
+  //  목표가 바뀌면 지금 값에서 새로 트윈을 시작한다(전환 중 다시 바꿔도 안전).
+  if(P.hueShift !== hueTo){
+    hueFrom = hueShiftShown;
+    hueTo   = P.hueShift;
+    hueT    = 0;
+  }
+  if(hueT < 1){
+    hueT = Math.min(1, hueT + dt / HUE_TWEEN_SEC);
+    //  ease-in-out: 시작과 끝이 부드럽다(중간이 가장 빠름).
+    const e = hueT < 0.5 ? 2*hueT*hueT : 1 - Math.pow(-2*hueT + 2, 2)/2;
+    hueShiftShown = hueFrom + (hueTo - hueFrom) * e;
+  }else hueShiftShown = hueTo;
+
+  // ---- 인트로 → 기본값 전환 ----
+  if(started && introT < 1) introT = Math.min(1, introT + dt / INTRO_SEC);
+  //  감속 이징: 끝에서 완만히 멈춘다(1-(1-t)^3 = ease-out cubic).
+  const k = 1.0 - Math.pow(1.0 - introT, 3.0);
+  //  수치들을 인트로 → 기본값으로 보간. 사용자가 슬라이더를 만지면
+  //  P가 이미 기본값 쪽으로 세팅돼 있으므로 그대로 따라간다.
+  const lerp = (a, b) => a + (b - a) * k;
+  const shownEdge     = lerp(INTRO.edge,     P.edge);
+  const shownScale    = lerp(INTRO.scale,    P.scale);
+  const shownStretchX = lerp(INTRO.stretchX, P.stretchX);
+  const shownStretchY = lerp(INTRO.stretchY, P.stretchY);
+  //  인트로 자전도 같은 이징으로 0까지 줄어든다.
+  introSpin += INTRO_SPIN * (1.0 - k) * dt;
+
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, (now-t0)/1000);
+  //  퇴장 회전을 얹어 보낸다(마우스 회전과 합산).
+  //  인트로 자전(introSpin)을 함께 얹는다. 구는 실루엣이 같아 회전이
+  //  색·음영의 흐름으로 보인다.
+  gl.uniform2f(uSpin, spin.x + exitSpin + introSpin,
+                      spin.y + exitSpin*0.55 + introSpin*0.42);
+  //  [변경] 오프셋을 풀지 않고 계속 유지한다 → 큐브도 구와 같은 파란 계열에서 출발.
+  //   hue는 마우스를 움직이면 계속 흐르므로, 이후 색 변화는 그대로 살아 있다.
+  gl.uniform1f(uHue, hue + hueOffset);
+  gl.uniform1f(uSteps, P.steps);
+  gl.uniform1f(uStepMode, P.uniform ? 1.0 : 0.0);
+  gl.uniform1f(uEdge, shownEdge);
+  gl.uniform1f(uDensity, P.density);
+  //  인트로에선 완전한 구(1.0), 전환되며 shape(슬라이더 추종값)로 넘어간다.
+  gl.uniform1f(uShape, lerp(INTRO.shape, shape));
+  gl.uniform1f(uEther, ether);
+  gl.uniform2f(uMouse, mousePos.x, mousePos.y);
+  gl.uniform2f(uGlow, glowPos.x, glowPos.y);
+  gl.uniform1f(uHueShift, hueShiftShown * Math.PI / 180);   // 도 → 라디안(2초 트윈된 값)
+  //  큐브 투명도: 퇴장 마지막 0.7초 / 등장 처음 0.7초에만 선형으로 움직인다.
+  gl.uniform1f(uCubeFade, drawScene === 'cube' ? Math.max(0, Math.min(1, sceneFade)) : 0);
+  gl.uniform1f(uWrithe, writhe);
+  gl.uniform1f(uEtherZoom, etherZoom);
+  gl.uniform1f(uScale, shownScale * cubeZoom);
+  gl.uniform2f(uStretch, shownStretchX, shownStretchY);
+  //  지금 그릴 씬(퇴장 중이면 아직 이전 씬).
+  gl.uniform1f(uHarp, drawScene === 'harp' ? 1 : 0);
+  gl.uniform1f(uHarpZoom, harpZoom);
+  gl.uniform1f(uHarpSpin, harpSpin);
+  gl.uniform1f(uHarpGap,  harpGap);
+  gl.uniform1f(uHarpFade, harpFade);
+  gl.uniform1f(uEtherStyle, P.etherVol ? 1.0 : 0.0);
+  //  [인트로 색] 파랑 틴트를 빼면 색상환을 훑지 않고 파랑→원색으로 직진한다.
+  //   [곡선] 팔레트 평균색이 분홍(321°)이라 파랑(221°)에서 100° 이동은 불가피하다.
+  //   대신 pow(,0.45)로 "늦게" 풀어 대부분의 시간을 파랑에 머물게 하고,
+  //   변화를 마지막에 몰아준다 — 그때는 이미 큐브라 무늬가 시선을 가져간다.
+  gl.uniform1f(uBlueTint, Math.pow(1.0 - k, 0.45));
+  gl.uniform1f(uHarpCount, P.harpCount);
+  gl.uniform1f(uHarpThick, P.harpThick);
+  gl.uniform1f(uHarpSpread, P.harpSpread);
+  //  마우스 x가 판의 회전각을 밀어준다. 좌우 끝에서 ±약 90°까지 돌아가
+  //  "정면(넓음) ↔ 옆면(얇음)"을 한 번 왕복한다.
+  gl.uniform1f(uHarpTurn, mousePos.x * P.harpTurn * 2.4);
+  gl.uniform2f(uHarpPull, harpPullX, pullK);
+  gl.uniform2f(uHarpPull2, harpPullX2, pullK2);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  statusEl.textContent = `spin (${spin.x.toFixed(2)},${spin.y.toFixed(2)}) · vel ${speed.toFixed(2)} · hue ${hue.toFixed(1)} · DPR ${DPR.toFixed(1)}`;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+//  마우스가 창을 벗어나면 인력을 놓는다 → 판이 부드럽게 제자리로 돌아간다.
+addEventListener('mouseout', e=>{ if(!e.relatedTarget) pullTarget = 0; });
+addEventListener('blur', ()=>{ pullTarget = 0; });
+
+addEventListener('keydown', e=>{
+  if(e.key==='d'||e.key==='D') document.body.classList.toggle('debug');
+  if(e.key==='p'||e.key==='P') document.body.classList.toggle('hidepanel');
+});
+</script>
